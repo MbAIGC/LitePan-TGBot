@@ -1,7 +1,7 @@
 FROM python:3.12-alpine
 
 WORKDIR /app
-RUN pip install --no-cache-dir pypinyin
+RUN pip install --no-cache-dir pypinyin==0.54.0
 COPY tgbot.py /app/tgbot.py
 
 ENV PYTHONUNBUFFERED=1 \

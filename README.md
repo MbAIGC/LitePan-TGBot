@@ -105,7 +105,7 @@ docker run -d --name litepan-tgbot \
 | `litepan_url` / `api_key` | users.json / .env | LitePan 地址和任务 Key |
 | `admin_user` / `admin_password` | users.json / .env | 管理员账号，开启自动发现、精确执行和回执 |
 | `drives` | users.json / .env | 手动盘名映射（有管理员账号后一般不用配） |
-| `default_event` | users.json / .env | 默认事件，未配管理员时 `/refresh` 的兜底 |
+| `default_event` | users.json / .env | 兜底事件（env 里为 `LITEPAN_FALLBACK_EVENT`，旧名 `LITEPAN_EVENT` 兼容），未配管理员时 `/refresh` 使用 |
 | `show_url` | users.json / .env | 调试时是否显示 LitePan 地址，默认不显示 |
 | `TG_MENU_REFRESH_MINUTES` | .env | 菜单自动刷新间隔，默认 30 分钟 |
 
@@ -116,6 +116,10 @@ docker run -d --name litepan-tgbot \
 
 - **收不到完成回执？**
   确认 `users.json` 里配了管理员账号，任务跑完才会推结果。
+
+- **旧的 `.env` 还能用吗？**
+  兼容。新增的 `LITEPAN_FALLBACK_EVENT` 会自动回退读取旧名 `LITEPAN_EVENT`；唯一例外是旧 `.env`
+  如果没配 `TG_ALLOWED_IDS`，现在启动会报错要求补上——这是安全修复，防止任何陌生人使用你的 Bot。
 
 - **菜单没出现新规则？**
   发一次 `/menu`，或等最多 30 分钟自动刷新；Telegram 客户端有时要重新打开输入框才显示。

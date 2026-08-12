@@ -25,6 +25,7 @@ class StubLite:
     triggers = []
     runs = []
     finish_status = "running"
+    fail_snapshot = False
 
     def __init__(self, profile):
         pass
@@ -41,6 +42,8 @@ class StubLite:
         return {"rule_id": rule_id, "submitted": True, "trigger_source": "manual"}
 
     def max_run_id(self):
+        if StubLite.fail_snapshot:
+            raise tgbot.LitePanError("快照失败（测试）")
         return len(StubLite.runs)
 
     def list_runs(self, rule_id, limit=5):
@@ -115,11 +118,13 @@ def main():
     tgbot.LitePanClient = StubLite
     profile = make_profile()
     menu_calls = []
+    tg_calls = []
     messages = []
 
     bot = tgbot.TelegramBot(make_cfg(profile))
 
     def fake_tg(method, params):
+        tg_calls.append((method, params))
         if method == "setMyCommands":
             menu_calls.append(params)
         return None
@@ -232,6 +237,58 @@ def main():
     bot2.tg_call = fake_tg
     bot2.refresh_menu()
     assert any(c["command"] == "refresh_am_gy01_juji" for c in menu_calls[-1]["commands"])
+
+    # slug 限长：refresh_ 前缀 + slug 不超过 32 字符，且重名去重不超长
+    used = set()
+    long_slug = tgbot._fit_slug(tgbot._slugify("AM-" + "剧" * 30), used)
+    assert len(long_slug) <= tgbot.MAX_SLUG_LEN
+    assert len("refresh_" + long_slug) <= 32
+    dup_slug = tgbot._fit_slug(long_slug, used)
+    assert dup_slug != long_slug and len(dup_slug) <= tgbot.MAX_SLUG_LEN
+
+    # 超长消息分块发送（Telegram 单条上限 4096）
+    tg_calls.clear()
+    bot3 = tgbot.TelegramBot(make_cfg(profile))
+    bot3.tg_call = fake_tg
+    bot3.say(123456789, "行" * 9000)
+    sent = [p["text"] for m, p in tg_calls if m == "sendMessage"]
+    assert len(sent) == 3 and all(len(t) <= tgbot.MAX_MESSAGE_LEN for t in sent)
+
+    # 回执快照失败不阻断规则执行
+    StubLite.fail_snapshot = True
+    StubLite.runs.clear()
+    bot.run_rule_and_report(123456789, profile, d.rule_by_slug["am_gy01_juji"])
+    assert StubLite.runs == [1], StubLite.runs
+    assert "已提交执行规则" in messages[-1][1]
+    StubLite.fail_snapshot = False
+
+    # 单用户 .env 模式必须配置 TG_ALLOWED_IDS；旧名 LITEPAN_EVENT 兼容
+    saved_env = {k: os.environ.get(k) for k in (
+        "TG_BOT_TOKEN", "TG_ALLOWED_IDS", "USERS_FILE",
+        "LITEPAN_URL", "LITEPAN_API_KEY", "LITEPAN_FALLBACK_EVENT", "LITEPAN_EVENT")}
+    try:
+        os.environ["TG_BOT_TOKEN"] = "123:abc"
+        os.environ.pop("TG_ALLOWED_IDS", None)
+        os.environ.pop("USERS_FILE", None)
+        os.environ["LITEPAN_URL"] = "http://x:5211"
+        os.environ["LITEPAN_API_KEY"] = "lpk_api_x"
+        try:
+            tgbot.Config()
+            raise SystemExit("应当要求白名单")
+        except tgbot.ConfigError as e:
+            assert "TG_ALLOWED_IDS" in str(e)
+        os.environ["TG_ALLOWED_IDS"] = "123"
+        cfg_legacy = tgbot.Config()
+        assert cfg_legacy.fallback is not None
+        os.environ.pop("LITEPAN_FALLBACK_EVENT", None)
+        os.environ["LITEPAN_EVENT"] = "old_event"
+        assert tgbot.UserProfile.from_env().default_event == "old_event"
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     # 无 pypinyin 时退化：只保留 ASCII
     orig = tgbot._PINYIN_AVAILABLE

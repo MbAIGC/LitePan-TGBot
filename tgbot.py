@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import signal
 import socket
 import sys
 import threading
@@ -34,6 +35,7 @@ import urllib.request
 from http.cookiejar import CookieJar
 
 log = logging.getLogger("litepan-tgbot")
+_AUTH_LOCK = threading.Lock()
 
 try:
     from pypinyin import lazy_pinyin
@@ -113,6 +115,44 @@ def _slugify(name):
     if _PINYIN_AVAILABLE:
         name = "".join(lazy_pinyin(name))
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+MAX_SLUG_LEN = 24
+MAX_MENU_COMMANDS = 100
+MAX_MESSAGE_LEN = 4000
+
+
+def _fit_slug(slug, used, max_len=MAX_SLUG_LEN):
+    """保证 slug 不超长且唯一：'refresh_' 前缀 + slug 总长不超过 32 字符。"""
+    slug = slug[:max_len]
+    base, i = slug, 1
+    while slug in used:
+        i += 1
+        suffix = "_%d" % i
+        slug = base[: max_len - len(suffix)] + suffix
+    used.add(slug)
+    return slug
+
+
+def _chunk_text(text, limit=MAX_MESSAGE_LEN):
+    """按行把长文本切成不超过 limit 的片段（Telegram 单条消息上限 4096）。"""
+    if len(text) <= limit:
+        return [text]
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if cur and len(cur) + 1 + len(line) > limit:
+            chunks.append(cur)
+            cur = ""
+        cur = cur + ("\n" if cur else "") + line
+    if cur:
+        chunks.append(cur)
+    return chunks
 
 
 def _safe_json(raw):
@@ -226,10 +266,19 @@ class UserProfile:
     @staticmethod
     def from_dict(raw):
         chat_ids = raw.get("chat_ids") or raw.get("chat_id") or []
-        if isinstance(chat_ids, (int, str)):
+        if isinstance(chat_ids, str):
+            chat_ids = re.split(r"[,，\s]+", chat_ids)
+        elif isinstance(chat_ids, (int, float)):
             chat_ids = [chat_ids]
-        if not chat_ids:
+        parsed = []
+        for c in chat_ids:
+            try:
+                parsed.append(int(str(c).strip()))
+            except (TypeError, ValueError):
+                raise ConfigError("users.json 条目 chat_ids 含非法值: %r" % (c,))
+        if not parsed:
             raise ConfigError("users.json 中存在没有 chat_ids 的条目")
+        chat_ids = parsed
         lite_url = str(raw.get("litepan_url") or "").strip()
         api_key = str(raw.get("api_key") or "").strip()
         if not lite_url or not api_key:
@@ -258,7 +307,8 @@ class UserProfile:
             chat_ids=[],
             lite_url=_env("LITEPAN_URL", required=True),
             api_key=_env("LITEPAN_API_KEY", required=True),
-            default_event=_normalize_event(_env("LITEPAN_EVENT", "tg_refresh")),
+            # 兼容旧配置：优先读新名，未设置时回退旧名 LITEPAN_EVENT
+            default_event=_normalize_event(_env("LITEPAN_FALLBACK_EVENT", _env("LITEPAN_EVENT", "tg_refresh"))),
             source=_env("LITEPAN_SOURCE", "telegram"),
             default_path=_env("LITEPAN_DEFAULT_PATH", "/"),
             message=_env("LITEPAN_MESSAGE", ""),
@@ -299,6 +349,10 @@ class Config:
             raise ConfigError(
                 "未找到任何 LitePan 配置：请配置 users.json（USERS_FILE），"
                 "或使用 .env 单用户模式（LITEPAN_URL / LITEPAN_API_KEY）"
+            )
+        if self.fallback is not None and not self._allowed_ids_env:
+            raise ConfigError(
+                "单用户 .env 模式必须配置 TG_ALLOWED_IDS 白名单，否则任何人都能使用你的 Bot"
             )
         if not 1 <= self.poll_timeout <= 300:
             raise ConfigError("TG_POLL_TIMEOUT 需在 1~300 之间")
@@ -434,26 +488,18 @@ class Discovery:
             if not slug:
                 pan_i += 1
                 slug = "pan%d" % pan_i
-            base, i = slug, 1
-            while slug in used:
-                i += 1
-                slug = "%s_%d" % (base, i)
-            used.add(slug)
+            slug = _fit_slug(slug, used)
             self.slugs[slug] = name
             self.account_slug[name] = slug
 
     def _build_rule_slugs(self):
-        """按规则名生成菜单命令 slug，重名自动加 _2/_3 后缀。"""
+        """按规则名生成菜单命令 slug：限长 + 重名自动加 _2/_3 后缀。"""
         used = set()
         for r in sorted(self.rules, key=lambda x: x["id"]):
             slug = _slugify(r["name"])
             if not slug:
                 slug = "rule_%s" % r["id"]
-            base, i = slug, 1
-            while slug in used:
-                i += 1
-                slug = "%s_%d" % (base, i)
-            used.add(slug)
+            slug = _fit_slug(slug, used)
             r["slug"] = slug
             self.rule_by_slug[slug] = r
 
@@ -486,6 +532,8 @@ class TelegramBot:
         self.stop = threading.Event()
         self._discovery_cache = {}
         self._discovery_ttl = 60
+        self._discovery_fetch_lock = threading.Lock()
+        self._menu_lock = threading.Lock()
         self._last_menu_refresh = 0.0
         self._last_menu_commands = None
 
@@ -502,10 +550,11 @@ class TelegramBot:
         raise TgError(code or 0, desc or "未知错误")
 
     def say(self, chat_id, text):
-        try:
-            self.tg_call("sendMessage", {"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
-        except TgError as e:
-            log.warning("sendMessage 失败 chat=%s: %s", chat_id, e)
+        for chunk in _chunk_text(text):
+            try:
+                self.tg_call("sendMessage", {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True})
+            except TgError as e:
+                log.warning("sendMessage 失败 chat=%s: %s", chat_id, e)
 
     def _load_offset(self):
         try:
@@ -524,39 +573,45 @@ class TelegramBot:
     def run(self):
         log.info("Bot 启动：%d 个用户配置", len(self.cfg.profiles) + (1 if self.cfg.fallback else 0))
         log.info("命令菜单拼音支持：%s", "开启" if _PINYIN_AVAILABLE else "关闭（纯中文规则名用编号兜底）")
-        self.refresh_menu()
+        # 启动时后台刷新菜单，不阻塞长轮询（LitePan 不可达时最多等 lite_timeout 秒）
+        threading.Thread(target=self.refresh_menu, daemon=True).start()
         self._last_menu_refresh = time.time()
-        while not self.stop.is_set():
-            if self._menu_due():
-                self.refresh_menu()
-            try:
-                updates = self.tg_call(
-                    "getUpdates",
-                    {"offset": self.offset, "timeout": self.cfg.poll_timeout, "allowed_updates": ["message"]},
-                )
-            except TgError as e:
-                if e.code == 401:
-                    log.error("Telegram token 无效，退出")
-                    return
-                if e.code == 409:
-                    log.error("409 冲突：已有另一个实例在轮询 getUpdates，请确保单实例运行")
-                    return
-                log.warning("getUpdates 失败: %s", e)
-                time.sleep(10)
-                continue
-            except Exception as e:
-                log.warning("getUpdates 异常: %s", e)
-                time.sleep(10)
-                continue
-            if not updates:
-                continue
-            for u in updates:
-                self.offset = max(self.offset, int(u.get("update_id", 0)) + 1)
-                if "message" in u:
-                    try:
-                        self.handle_message(u["message"])
-                    except Exception as e:
-                        log.exception("处理消息失败: %s", e)
+        try:
+            while not self.stop.is_set():
+                if self._menu_due():
+                    self.refresh_menu()
+                try:
+                    updates = self.tg_call(
+                        "getUpdates",
+                        {"offset": self.offset, "timeout": self.cfg.poll_timeout, "allowed_updates": ["message"]},
+                    )
+                except TgError as e:
+                    if e.code == 401:
+                        log.error("Telegram token 无效，退出")
+                        return
+                    if e.code == 409:
+                        log.error("409 冲突：已有另一个实例在轮询 getUpdates，5 分钟后重试")
+                        if self.stop.wait(300):
+                            break
+                        continue
+                    log.warning("getUpdates 失败: %s", e)
+                    time.sleep(10)
+                    continue
+                except Exception as e:
+                    log.warning("getUpdates 异常: %s", e)
+                    time.sleep(10)
+                    continue
+                if not updates:
+                    continue
+                for u in updates:
+                    self.offset = max(self.offset, int(u.get("update_id", 0)) + 1)
+                    if "message" in u:
+                        try:
+                            self.handle_message(u["message"])
+                        except Exception as e:
+                            log.exception("处理消息失败: %s", e)
+                self._save_offset()
+        finally:
             self._save_offset()
 
     @staticmethod
@@ -575,7 +630,7 @@ class TelegramBot:
                 "/refresh_<规则>   菜单快捷命令，精确触发单条规则",
                 "/info             查看连接状态、配置、规则与盘名",
                 "/menu             手动更新命令菜单",
-                "/run <事件> [路径] 高级：触发任意 Webhook 事件（同名事件会全部触发）",
+                "/run <事件>    高级：触发任意 Webhook 事件（同名事件会全部触发）",
                 "/start /help      显示本帮助",
             ]
         )
@@ -609,7 +664,7 @@ class TelegramBot:
         elif cmd == "/run":
             parts = arg.split(None, 1)
             if not parts:
-                self.say(chat_id, "用法：/run <事件名> [路径]，例如 /run quark01_refresh /")
+                self.say(chat_id, "用法：/run <事件名>，例如 /run quark01_refresh")
                 return
             event = parts[0]
             path = parts[1] if len(parts) > 1 else profile.default_path
@@ -642,9 +697,13 @@ class TelegramBot:
         if not profile.receipt_enabled:
             self.trigger_and_report(chat_id, profile, rule["event"], profile.source, profile.default_path)
             return
+        client = LitePanClient(profile)
+        pre_base = 0
         try:
-            client = LitePanClient(profile)
             pre_base = client.max_run_id()
+        except LitePanError as e:
+            log.warning("回执快照失败，退化为 0：%s", e)
+        try:
             client.run_rule(rule["id"])
         except LitePanError as e:
             self.say(chat_id, "⚠️ 规则「%s」提交失败：%s\n可改用 /run %s 触发。" % (rule["name"], e, rule["event"]))
@@ -652,7 +711,7 @@ class TelegramBot:
         self.say(chat_id, "✅ 已提交执行规则：「%s」\n任务异步执行中。" % rule["name"])
         threading.Thread(
             target=self.watch_run,
-            args=(chat_id, profile, rule["id"], rule["name"], pre_base),
+            args=(chat_id, profile, rule["id"], rule["name"], pre_base, client),
             daemon=True,
         ).start()
 
@@ -671,11 +730,12 @@ class TelegramBot:
         ok_names, failed = [], []
         for rule in rules:
             try:
-                LitePanClient(profile).run_rule(rule["id"])
+                client = LitePanClient(profile)
+                client.run_rule(rule["id"])
                 ok_names.append(rule["name"])
                 threading.Thread(
                     target=self.watch_run,
-                    args=(chat_id, profile, rule["id"], rule["name"], pre_base),
+                    args=(chat_id, profile, rule["id"], rule["name"], pre_base, client),
                     daemon=True,
                 ).start()
             except LitePanError as e:
@@ -690,7 +750,10 @@ class TelegramBot:
         """/refresh 触发所有规则；/refresh <盘名> 精确触发指定盘。"""
         if not arg:
             d = self._discovery(chat_id, profile)
-            if d and d.rules:
+            if d is not None:
+                if not d.rules:
+                    self.say(chat_id, "后台还没有 Webhook 自动化规则，请先在 LitePan「自动联动」里创建。")
+                    return
                 self.run_rules_and_report(chat_id, profile, d.rules)
                 return
             events = self.default_events(chat_id, profile)
@@ -734,15 +797,19 @@ class TelegramBot:
         cached = self._discovery_cache.get(chat_id)
         if cached is not None and now - cached[0] < self._discovery_ttl:
             return cached[1]
-        d = Discovery(profile)
-        try:
-            d.fetch()
-            self._discovery_cache[chat_id] = (now, d)
-            return d
-        except LitePanError as e:
-            log.warning("自动发现失败 chat=%s: %s", chat_id, e)
-            self._discovery_cache[chat_id] = (now, None)
-            return None
+        with self._discovery_fetch_lock:
+            cached = self._discovery_cache.get(chat_id)
+            if cached is not None and time.time() - cached[0] < self._discovery_ttl:
+                return cached[1]
+            d = Discovery(profile)
+            try:
+                d.fetch()
+                self._discovery_cache[chat_id] = (time.time(), d)
+                return d
+            except LitePanError as e:
+                log.warning("自动发现失败 chat=%s: %s", chat_id, e)
+                self._discovery_cache[chat_id] = (time.time(), None)
+                return None
 
     def info_text(self, chat_id, profile):
         """/info：连接状态 + 配置摘要 + 自动发现结果（规则、盘名、菜单命令）。"""
@@ -793,6 +860,10 @@ class TelegramBot:
         return "\n".join(lines)
 
     def refresh_menu(self, profile=None, force=False):
+        with self._menu_lock:
+            return self._refresh_menu_locked(profile, force)
+
+    def _refresh_menu_locked(self, profile, force):
         """把发现的规则映射成 Telegram 命令菜单（setMyCommands）。
 
         默认只在命令列表发生变化时才调用 Telegram API，避免无意义的频繁请求；
@@ -820,6 +891,9 @@ class TelegramBot:
                 for slug, rule in d.rule_by_slug.items():
                     commands.append({"command": "refresh_%s" % slug, "description": rule["name"]})
         commands.append({"command": "run", "description": "高级：触发任意事件"})
+        if len(commands) > MAX_MENU_COMMANDS:
+            log.warning("规则命令超过 %d 条，菜单已截断", MAX_MENU_COMMANDS)
+            commands = commands[:MAX_MENU_COMMANDS]
         if not force and commands == self._last_menu_commands:
             self._last_menu_refresh = time.time()
             return True
@@ -867,13 +941,13 @@ class TelegramBot:
                     daemon=True,
                 ).start()
 
-    def watch_run(self, chat_id, profile, rule_id, rule_name, pre_base=0):
+    def watch_run(self, chat_id, profile, rule_id, rule_name, pre_base=0, client=None):
         """等待触发后新产生的运行并推送回执。
 
         pre_base 是触发前的全局最大运行 ID：触发前先快照，运行创建后其 ID 必然大于
         快照，即使规则秒完成、快照时运行已结束，也能被识别并回执。
         """
-        client = LitePanClient(profile)
+        client = client or LitePanClient(profile)
         deadline = time.time() + profile.receipt_timeout
         target = None
         while time.time() < deadline:
@@ -887,13 +961,15 @@ class TelegramBot:
                 rid = int(r.get("id") or 0)
                 if rid <= pre_base:
                     continue
-                if target is None:
+                if target is None or rid < target:
                     target = rid
                 if rid == target and r.get("status") != "running":
                     self.say(chat_id, self.render_result(rule_name, r))
                     return
+            if self.stop.is_set():
+                return
             time.sleep(profile.receipt_poll)
-        self.say(chat_id, "⏱️ 等待规则「%s」执行结果超时（%ds）。" % (rule_name, profile.receipt_timeout))
+        self.say(chat_id, "⏱️ 规则「%s」仍在执行或排队，未在 %d 秒内收到完成回执。" % (rule_name, profile.receipt_timeout))
 
     @staticmethod
     def render_result(rule_name, run):
@@ -970,12 +1046,13 @@ class LitePanClient:
         return body.get("data") or {}
 
     def login(self):
-        status, body = self.request(
-            "/api/auth/login",
-            method="POST",
-            data={"username": self.cfg.admin_user, "password": self.cfg.admin_password, "remember": "0"},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+        with _AUTH_LOCK:
+            status, body = self.request(
+                "/api/auth/login",
+                method="POST",
+                data={"username": self.cfg.admin_user, "password": self.cfg.admin_password, "remember": "0"},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
         if status >= 400 or not body.get("success"):
             msg = body.get("message") if isinstance(body, dict) else "HTTP %d" % status
             raise LitePanError("管理员登录失败：%s" % msg)
@@ -1029,11 +1106,17 @@ def main():
         print(cfg.check_summary())
         return
     bot = TelegramBot(cfg)
+
+    def _handle_signal(_signum, _frame):
+        bot.stop.set()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
     try:
         bot.run()
     except KeyboardInterrupt:
         bot.stop.set()
-        log.info("收到中断，退出")
+    log.info("Bot 已退出")
 
 
 if __name__ == "__main__":
