@@ -24,6 +24,7 @@ def make_profile():
 class StubLite:
     triggers = []
     runs = []
+    finish_status = "running"
 
     def __init__(self, profile):
         pass
@@ -39,8 +40,13 @@ class StubLite:
         StubLite.runs.append(rule_id)
         return {"rule_id": rule_id, "submitted": True, "trigger_source": "manual"}
 
+    def max_run_id(self):
+        return len(StubLite.runs)
+
     def list_runs(self, rule_id, limit=5):
-        return []
+        return [{"id": max(len(StubLite.runs), 1), "rule_id": rule_id,
+                 "status": StubLite.finish_status, "message": "ok",
+                 "result": {"steps": [{"type": "strm", "name": "STRM任务", "status": "success"}]}}]
 
     def admin_get(self, path):
         if path == "/api/admin/accounts":
@@ -204,6 +210,13 @@ def main():
     send("/refresh /Movies")
     assert "路径参数已不再支持" in messages[-1][1]
     assert StubLite.runs == [1, 2, 3]
+
+    # 回执竞态：触发前快照 pre_base，即使运行在快照前已完成也能收到回执
+    StubLite.finish_status = "success"
+    StubLite.runs.clear()
+    bot.watch_run(123456789, profile, 1, "AM-GY01-剧集", pre_base=0)
+    assert "AM-GY01-剧集" in messages[-1][1] and "执行完成" in messages[-1][1], messages[-1][1]
+    StubLite.finish_status = "running"
 
     # 定时刷新：到期才刷，刷新后重置计时
     bot._last_menu_refresh = time.time() - 1801

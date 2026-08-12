@@ -643,14 +643,16 @@ class TelegramBot:
             self.trigger_and_report(chat_id, profile, rule["event"], profile.source, profile.default_path)
             return
         try:
-            LitePanClient(profile).run_rule(rule["id"])
+            client = LitePanClient(profile)
+            pre_base = client.max_run_id()
+            client.run_rule(rule["id"])
         except LitePanError as e:
             self.say(chat_id, "⚠️ 规则「%s」提交失败：%s\n可改用 /run %s 触发。" % (rule["name"], e, rule["event"]))
             return
         self.say(chat_id, "✅ 已提交执行规则：「%s」\n任务异步执行中。" % rule["name"])
         threading.Thread(
             target=self.watch_run,
-            args=(chat_id, profile, rule["id"], rule["name"]),
+            args=(chat_id, profile, rule["id"], rule["name"], pre_base),
             daemon=True,
         ).start()
 
@@ -661,6 +663,11 @@ class TelegramBot:
             for ev in events:
                 self.trigger_and_report(chat_id, profile, ev, profile.source, profile.default_path)
             return
+        pre_base = 0
+        try:
+            pre_base = LitePanClient(profile).max_run_id()
+        except LitePanError as e:
+            log.warning("回执快照失败，退化为 0：%s", e)
         ok_names, failed = [], []
         for rule in rules:
             try:
@@ -668,7 +675,7 @@ class TelegramBot:
                 ok_names.append(rule["name"])
                 threading.Thread(
                     target=self.watch_run,
-                    args=(chat_id, profile, rule["id"], rule["name"]),
+                    args=(chat_id, profile, rule["id"], rule["name"], pre_base),
                     daemon=True,
                 ).start()
             except LitePanError as e:
@@ -830,6 +837,12 @@ class TelegramBot:
         return time.time() - self._last_menu_refresh >= self.cfg.menu_refresh_minutes * 60
 
     def trigger_and_report(self, chat_id, profile, event, source, path):
+        pre_base = 0
+        if profile.receipt_enabled:
+            try:
+                pre_base = LitePanClient(profile).max_run_id()
+            except LitePanError as e:
+                log.warning("回执快照失败，退化为 0：%s", e)
         try:
             data = LitePanClient(profile).trigger(event, source, path)
         except LitePanError as e:
@@ -850,20 +863,19 @@ class TelegramBot:
             for t in triggered:
                 threading.Thread(
                     target=self.watch_run,
-                    args=(chat_id, profile, t.get("id"), t.get("name") or ""),
+                    args=(chat_id, profile, t.get("id"), t.get("name") or "", pre_base),
                     daemon=True,
                 ).start()
 
-    def watch_run(self, chat_id, profile, rule_id, rule_name):
+    def watch_run(self, chat_id, profile, rule_id, rule_name, pre_base=0):
+        """等待触发后新产生的运行并推送回执。
+
+        pre_base 是触发前的全局最大运行 ID：触发前先快照，运行创建后其 ID 必然大于
+        快照，即使规则秒完成、快照时运行已结束，也能被识别并回执。
+        """
         client = LitePanClient(profile)
-        try:
-            base = 0
-            for r in client.list_runs(rule_id, 5):
-                base = max(base, int(r.get("id") or 0))
-        except LitePanError as e:
-            self.say(chat_id, "⚠️ 回执模式初始化失败：%s" % e)
-            return
         deadline = time.time() + profile.receipt_timeout
+        target = None
         while time.time() < deadline:
             try:
                 runs = client.list_runs(rule_id, 5)
@@ -873,7 +885,11 @@ class TelegramBot:
                 continue
             for r in runs:
                 rid = int(r.get("id") or 0)
-                if rid > base and r.get("status") != "running":
+                if rid <= pre_base:
+                    continue
+                if target is None:
+                    target = rid
+                if rid == target and r.get("status") != "running":
                     self.say(chat_id, self.render_result(rule_name, r))
                     return
             time.sleep(profile.receipt_poll)
@@ -974,6 +990,13 @@ class LitePanClient:
             msg = body.get("message") if isinstance(body, dict) else "HTTP %d" % status
             raise LitePanError(msg)
         return body.get("data") or []
+
+    def max_run_id(self):
+        """当前全局最大运行 ID（运行列表按 ID 倒序，取第一条即可）。"""
+        runs = self.admin_get("/api/admin/automation/runs?limit=1")
+        if runs:
+            return int((runs[0] or {}).get("id") or 0)
+        return 0
 
     def run_rule(self, rule_id):
         """按规则 ID 精确执行（管理接口），401 时自动重新登录再试一次。"""
