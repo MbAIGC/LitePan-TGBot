@@ -81,6 +81,7 @@ python3 tgbot.py                  # 启动
 | --- | --- |
 | `/refresh` | 触发本会话的默认规则（即“全盘”规则，动作链里挂了几个盘就刷几个） |
 | `/refresh <盘名>` | 触发指定盘对应的规则，如 `/refresh 光鸭-A`（盘名取自 LitePan 账号，无需手工配置） |
+| `/refresh_<盘>` | Telegram 命令菜单里按账号自动生成的快捷命令，如 `/refresh_gy01` |
 | `/refresh /路径` | 触发默认规则，路径仅作记录（LitePan 规则匹配不依赖路径） |
 | `/list` | 自动列出 LitePan 里的账号、规则（事件→名称→涉及任务）与盘名 |
 | `/run <事件> [路径]` | 触发任意 Webhook 事件，如 `/run quarkA_refresh` |
@@ -95,6 +96,16 @@ python3 tgbot.py                  # 启动
 - `/refresh 光鸭-A` → 直接按 LitePan 里的**账号名**匹配，触发涉及该账号任务的规则；
 - `/list` → 直接显示 LitePan 里的规则：`事件 → 规则名 → 涉及任务`，如 `quarkA_refresh → 「光鸭-A刷新」，任务：光鸭-A-TV`；
 - `default_event` 填 `auto`（或留空）时，`/refresh` 自动采用唯一一条 Webhook 规则；有多条时 `/list` 会提示你指定。
+
+### 命令菜单自动映射
+
+Bot 启动和每次 `/list` 时，会自动调用 `setMyCommands` 把发现的账号注册成 Telegram 命令菜单
+（聊天输入框点 `/` 弹出的列表）：
+
+- 静态命令：`/start` `/refresh` `/list` `/run` `/ping` `/status`；
+- 动态命令：每个有单盘规则的账号生成一个 `/refresh_<盘>`，例如账号 `GY01` → `/refresh_gy01`（描述：刷新 GY01）；
+- 账号名会自动转成 Telegram 允许的命令格式（小写字母/数字/下划线，纯中文名按 `pan1`、`pan2` 顺序命名），`/list` 里会显示对应的快捷命令名；
+- 菜单更新后，Telegram 客户端可能需要重新打开输入框或稍等片刻才能看到新命令。
 
 管理员账号本来就是为了“完成回执”而配的，现在一份配置同时解决回执和盘名自动发现，无需再维护 `DRIVES`。`DRIVES` 降级为“手动覆盖”：配了就优先用它，适合不想给 Bot 管理员权限的用户。
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import threading
@@ -93,6 +94,11 @@ def _env_drives(name):
         if alias and event:
             drives[alias] = event
     return drives
+
+
+def _slugify(name):
+    """把账号名转成 Telegram 命令可用的 slug（小写字母/数字/下划线）。"""
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
 
 def _safe_json(raw):
@@ -340,6 +346,8 @@ class Discovery:
         self.rules = []          # webhook 规则：{id, name, event, tasks:[], accounts:[]}
         self.by_event = {}       # event -> [规则]
         self.by_account = {}     # account_id -> set(event)（仅单账号规则）
+        self.slugs = {}          # slug（如 gy01） -> 账号名（如 GY01）
+        self.account_slug = {}   # 账号名 -> slug
 
     def fetch(self):
         client = LitePanClient(self.profile)
@@ -395,6 +403,24 @@ class Discovery:
             # 避免 /refresh 光鸭-A 误触发挂多账号任务的“全盘”规则。
             if len(task_accounts) == 1:
                 self.by_account.setdefault(next(iter(task_accounts)), set()).add(ev)
+        self._build_slugs()
+
+    def _build_slugs(self):
+        used = set()
+        pan_i = 0
+        for aid in sorted(self.by_account, key=lambda a: self.accounts.get(a, "")):
+            name = self.accounts.get(aid, "")
+            slug = _slugify(name)
+            if not slug:
+                pan_i += 1
+                slug = "pan%d" % pan_i
+            base, i = slug, 1
+            while slug in used:
+                i += 1
+                slug = "%s_%d" % (base, i)
+            used.add(slug)
+            self.slugs[slug] = name
+            self.account_slug[name] = slug
 
     def _task_label(self, kind, task_id):
         t = (self.strm_tasks if kind == "strm" else self.organize_tasks).get(task_id)
@@ -456,6 +482,7 @@ class TelegramBot:
 
     def run(self):
         log.info("Bot 启动：%d 个用户配置", len(self.cfg.profiles) + (1 if self.cfg.fallback else 0))
+        self.refresh_menu()
         while not self.stop.is_set():
             try:
                 updates = self.tg_call(
@@ -501,6 +528,7 @@ class TelegramBot:
                 "LitePan TG Bot 可用命令：",
                 "/refresh          触发默认规则（全盘）：%s" % default_event,
                 "/refresh <盘名>   触发指定盘，如 /refresh 光鸭-A（盘名取自 LitePan 账号）",
+                "/refresh_<盘>     菜单里按账号生成的快捷命令（/list 后自动更新）",
                 "/refresh /路径    触发默认规则，路径仅作记录",
                 "/list             自动列出本会话 LitePan 的账号、规则与事件",
                 "/run <事件> [路径] 触发任意 Webhook 事件",
@@ -532,8 +560,11 @@ class TelegramBot:
             self.status(chat_id, profile)
         elif cmd == "/list":
             self.say(chat_id, self.list_text(chat_id, profile))
+            self.refresh_menu(profile)
         elif cmd in ("/refresh", "/strm"):
             self.refresh(chat_id, profile, arg)
+        elif cmd.startswith("/refresh_"):
+            self.refresh_slug(chat_id, profile, cmd[len("/refresh_"):])
         elif cmd == "/run":
             parts = arg.split(None, 1)
             if not parts:
@@ -544,6 +575,20 @@ class TelegramBot:
             self.trigger_and_report(chat_id, profile, event, profile.source, path)
         else:
             self.say(chat_id, self.help_text(profile))
+
+    def refresh_slug(self, chat_id, profile, slug):
+        """处理菜单生成的 /refresh_<盘> 命令。"""
+        d = self._discovery(chat_id, profile)
+        if d is None or slug not in d.slugs:
+            self.say(chat_id, "未找到盘名命令「/refresh_%s」，可先 /list 查看。" % slug)
+            return
+        account = d.slugs[slug]
+        events = d.account_events(account)
+        if not events:
+            self.say(chat_id, "账号「%s」没有可触发的单盘规则。" % account)
+            return
+        for ev in events:
+            self.trigger_and_report(chat_id, profile, ev, profile.source, profile.default_path)
 
     def refresh(self, chat_id, profile, arg):
         """/refresh 不带参数=默认规则（全盘）；带 /路径=默认规则；带盘名=对应规则。"""
@@ -645,7 +690,10 @@ class TelegramBot:
             lines.append("")
             lines.append("盘名（/refresh 可用）：")
             for aid in account_ids:
-                lines.append("  %s → %s" % (d.accounts.get(aid, aid), "、".join(sorted(d.by_account[aid]))))
+                name = d.accounts.get(aid, aid)
+                slug = d.account_slug.get(name, "")
+                suffix = "（/refresh_%s）" % slug if slug else ""
+                lines.append("  %s%s → %s" % (name, suffix, "、".join(sorted(d.by_account[aid]))))
         if profile.drives:
             lines.append("")
             lines.append("手动覆盖（DRIVES）：%s" % profile.drive_list_text())
@@ -666,6 +714,37 @@ class TelegramBot:
             status = "⚠️ %s" % e
         discovery = "开启（自动读取账号/规则）" if self._discovery(chat_id, profile) is not None else "关闭（需管理员账号）"
         self.say(chat_id, profile.describe() + "\n自动发现: %s\n%s" % (discovery, status))
+
+    def refresh_menu(self, profile=None):
+        """把发现的账号映射成 Telegram 命令菜单（setMyCommands）。"""
+        commands = [
+            {"command": "start", "description": "帮助"},
+            {"command": "refresh", "description": "触发默认规则（全盘）"},
+            {"command": "list", "description": "查看账号与规则"},
+            {"command": "run", "description": "触发任意事件，如 /run 事件名"},
+            {"command": "ping", "description": "连通性检查"},
+            {"command": "status", "description": "查看配置"},
+        ]
+        profiles = []
+        if profile is not None:
+            profiles.append(profile)
+        else:
+            seen = set()
+            for p in list(self.cfg.profiles.values()) + ([self.cfg.fallback] if self.cfg.fallback else []):
+                if id(p) not in seen:
+                    seen.add(id(p))
+                    profiles.append(p)
+        for p in profiles:
+            chat_id = p.chat_ids[0] if p.chat_ids else 0
+            d = self._discovery(chat_id, p)
+            if d:
+                for slug, name in d.slugs.items():
+                    commands.append({"command": "refresh_%s" % slug, "description": "刷新 %s" % name})
+        try:
+            self.tg_call("setMyCommands", {"commands": commands})
+            log.info("菜单已更新：%d 个命令", len(commands))
+        except TgError as e:
+            log.warning("更新菜单失败: %s", e)
 
     def trigger_and_report(self, chat_id, profile, event, source, path):
         try:
