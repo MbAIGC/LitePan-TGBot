@@ -81,7 +81,7 @@ python3 tgbot.py                  # 启动
 | --- | --- |
 | `/refresh` | 触发本会话的默认规则（即“全盘”规则，动作链里挂了几个盘就刷几个） |
 | `/refresh <盘名>` | 触发指定盘对应的规则，如 `/refresh 光鸭-A`（盘名取自 LitePan 账号，无需手工配置） |
-| `/refresh_<规则>` | Telegram 命令菜单里按规则名自动生成的快捷命令，如 `/refresh_am_gy01_juji` |
+| `/refresh_<规则>` | 菜单里按规则名生成的快捷命令，如 `/refresh_am_gy01_juji`；按规则 ID 精确执行，不受同名事件影响 |
 | `/refresh /路径` | 触发默认规则，路径仅作记录（LitePan 规则匹配不依赖路径） |
 | `/list` | 自动列出 LitePan 里的账号、规则（事件→名称→涉及任务）与盘名 |
 | `/run <事件> [路径]` | 触发任意 Webhook 事件，如 `/run quarkA_refresh` |
@@ -96,6 +96,20 @@ python3 tgbot.py                  # 启动
 - `/refresh 光鸭-A` → 直接按 LitePan 里的**账号名**匹配，触发涉及该账号任务的规则；
 - `/list` → 直接显示 LitePan 里的规则：`事件 → 规则名 → 涉及任务`，如 `quarkA_refresh → 「光鸭-A刷新」，任务：光鸭-A-TV`；
 - `default_event` 填 `auto`（或留空）时，`/refresh` 自动采用唯一一条 Webhook 规则；有多条时 `/list` 会提示你指定。
+
+### 通知名称（事件名）冲突
+
+LitePan 的 webhook 是**按事件名全局匹配**的：两条规则用同一个通知名称（例如都是 `tg_refresh`），
+触发一次会**全部执行**，无法只跑其中一条。因此：
+
+- 菜单命令 `/refresh_<规则>` 和 `/refresh <盘名>` 已改为走管理接口**按规则 ID 精确执行**
+  （`POST /api/admin/automation/rules/{id}/run`），不受事件名冲突影响——配置了管理员账号即自动生效；
+- `/refresh`（全盘）与 `/run <事件>` 仍按事件触发，同名事件会全部执行，这正是“全盘”的语义；
+- 通知名称本身已被自动发现并显示在 `/list` 的“事件”列；它决定 `/refresh` 和 `/run` 的命中范围，
+  菜单单规则命令不依赖它。
+
+如果你的目标是让第三方 Webhook 也能精确触发，建议把后台每条规则的通知名称改成唯一的
+（如 `am_gy01_movie`、`am_gy01_tv`），两种方式可同时使用。
 
 ### 命令菜单自动映射
 

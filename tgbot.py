@@ -462,16 +462,20 @@ class Discovery:
             return t["name"]
         return "%s任务#%s" % (kind, task_id)
 
-    def account_events(self, name):
-        """按账号名查事件：先精确匹配，再唯一子串匹配。"""
+    def account_rules(self, name):
+        """按账号名查该账号的单盘规则：先精确匹配，再唯一子串匹配。"""
         target = name.strip().lower()
         exact = [aid for aid, n in self.accounts.items() if n.lower() == target]
-        if exact:
-            return sorted({ev for aid in exact for ev in self.by_account.get(aid, set())})
-        subs = [aid for aid, n in self.accounts.items() if target and (target in n.lower() or n.lower() in target)]
-        if len(subs) == 1:
-            return sorted(self.by_account.get(subs[0], set()))
-        return []
+        ids = set(exact)
+        if not ids:
+            subs = [aid for aid, n in self.accounts.items() if target and (target in n.lower() or n.lower() in target)]
+            if len(subs) != 1:
+                return []
+            ids = set(subs)
+        return [r for r in self.rules if len(r["accounts"]) == 1 and r["accounts"][0] in ids]
+
+    def account_events(self, name):
+        return sorted(set(r["event"] for r in self.account_rules(name)))
 
 
 class TelegramBot:
@@ -616,25 +620,66 @@ class TelegramBot:
             self.say(chat_id, self.help_text(profile))
 
     def refresh_slug(self, chat_id, profile, slug):
-        """处理菜单生成的 /refresh_<规则> 命令；找不到时回退按账号名匹配。"""
+        """处理菜单生成的 /refresh_<规则> 命令：按规则 ID 精确执行，避免同名事件误触发。"""
         d = self._discovery(chat_id, profile)
         if d is None:
             self.say(chat_id, "未找到盘名命令「/refresh_%s」，可先 /list 查看。" % slug)
             return
         rule = d.rule_by_slug.get(slug)
         if rule is not None:
-            self.trigger_and_report(chat_id, profile, rule["event"], profile.source, profile.default_path)
+            self.run_rule_and_report(chat_id, profile, rule)
             return
         account = d.slugs.get(slug)
-        if account is None:
-            self.say(chat_id, "未找到规则命令「/refresh_%s」，可先 /list 查看。" % slug)
-            return
-        events = d.account_events(account)
-        if not events:
+        if account is not None:
+            rules = d.account_rules(account)
+            if rules:
+                self.run_rules_and_report(chat_id, profile, rules)
+                return
             self.say(chat_id, "账号「%s」没有可触发的单盘规则。" % account)
             return
-        for ev in events:
-            self.trigger_and_report(chat_id, profile, ev, profile.source, profile.default_path)
+        self.say(chat_id, "未找到规则命令「/refresh_%s」，可先 /list 查看。" % slug)
+
+    def run_rule_and_report(self, chat_id, profile, rule):
+        """精确执行单条规则（管理接口按规则 ID）；无管理员账号时退回事件触发。"""
+        if not profile.receipt_enabled:
+            self.trigger_and_report(chat_id, profile, rule["event"], profile.source, profile.default_path)
+            return
+        try:
+            LitePanClient(profile).run_rule(rule["id"])
+        except LitePanError as e:
+            self.say(chat_id, "⚠️ 规则「%s」提交失败：%s\n可改用 /run %s 触发。" % (rule["name"], e, rule["event"]))
+            return
+        self.say(chat_id, "✅ 已提交执行规则：「%s」\n任务异步执行中。" % rule["name"])
+        threading.Thread(
+            target=self.watch_run,
+            args=(chat_id, profile, rule["id"], rule["name"]),
+            daemon=True,
+        ).start()
+
+    def run_rules_and_report(self, chat_id, profile, rules):
+        """精确执行账号下的多条单盘规则；无管理员账号时退回按事件触发。"""
+        if not profile.receipt_enabled:
+            events = sorted(set(r["event"] for r in rules))
+            for ev in events:
+                self.trigger_and_report(chat_id, profile, ev, profile.source, profile.default_path)
+            return
+        ok_names, failed = [], []
+        for rule in rules:
+            try:
+                LitePanClient(profile).run_rule(rule["id"])
+                ok_names.append(rule["name"])
+                threading.Thread(
+                    target=self.watch_run,
+                    args=(chat_id, profile, rule["id"], rule["name"]),
+                    daemon=True,
+                ).start()
+            except LitePanError as e:
+                failed.append((rule["name"], str(e)))
+        if ok_names:
+            self.say(chat_id, "✅ 已提交 %d 条规则执行：%s\n任务异步执行中。" % (
+                len(ok_names), "、".join("「%s」" % n for n in ok_names)))
+        for name, err in failed:
+            self.say(chat_id, "⚠️ 规则「%s」提交失败：%s" % (name, err))
 
     def refresh(self, chat_id, profile, arg):
         """/refresh 不带参数=默认规则（全盘）；带 /路径=默认规则；带盘名=对应规则。"""
@@ -657,15 +702,19 @@ class TelegramBot:
             for ev in events:
                 self.trigger_and_report(chat_id, profile, ev, profile.source, arg)
             return
-        events, source = self.resolve_events(chat_id, profile, arg)
-        if not events:
+        ev = profile.lookup_drive(arg)
+        if ev:
+            self.trigger_and_report(chat_id, profile, ev, profile.source, profile.default_path)
+            return
+        d = self._discovery(chat_id, profile)
+        rules = d.account_rules(arg) if d else []
+        if not rules:
             hint = "可先 /list 查看 LitePan 里的盘名。"
             if not profile.receipt_enabled:
                 hint = "未配置管理员账号，无法自动读取盘名；可配置 DRIVES 映射或在 users.json 填 admin 账号。" + hint
             self.say(chat_id, "未找到盘名「%s」。%s" % (arg, hint))
             return
-        for ev in events:
-            self.trigger_and_report(chat_id, profile, ev, profile.source, profile.default_path)
+        self.run_rules_and_report(chat_id, profile, rules)
 
     def default_events(self, chat_id, profile):
         if profile.default_event:
@@ -676,18 +725,6 @@ class TelegramBot:
             if len(events) == 1:
                 return events
         return []
-
-    def resolve_events(self, chat_id, profile, name):
-        """手动 DRIVES 覆盖优先，其次按 LitePan 账号名自动匹配。"""
-        ev = profile.lookup_drive(name)
-        if ev:
-            return [ev], "manual"
-        d = self._discovery(chat_id, profile)
-        if d:
-            events = d.account_events(name)
-            if events:
-                return events, "auto"
-        return [], None
 
     def _discovery(self, chat_id, profile):
         if not profile.receipt_enabled:
@@ -742,6 +779,9 @@ class TelegramBot:
         if profile.drives:
             lines.append("")
             lines.append("手动覆盖（DRIVES）：%s" % profile.drive_list_text())
+        if profile.receipt_enabled:
+            lines.append("")
+            lines.append("提示：/refresh_<规则> 与 /refresh <盘名> 按规则精确执行；同名通知事件只影响 /refresh 与 /run。")
         return "\n".join(lines)
 
     def ping(self, chat_id, profile):
@@ -940,6 +980,18 @@ class LitePanClient:
             msg = body.get("message") if isinstance(body, dict) else "HTTP %d" % status
             raise LitePanError(msg)
         return body.get("data") or []
+
+    def run_rule(self, rule_id):
+        """按规则 ID 精确执行（管理接口），401 时自动重新登录再试一次。"""
+        path = "/api/admin/automation/rules/%s/run" % rule_id
+        status, body = self.request(path, method="POST")
+        if status == 401 and self.cfg.receipt_enabled:
+            self.login()
+            status, body = self.request(path, method="POST")
+        if status >= 400 or not body.get("success"):
+            msg = body.get("message") if isinstance(body, dict) else "HTTP %d" % status
+            raise LitePanError(msg)
+        return body.get("data") or {}
 
     def list_runs(self, rule_id, limit=5):
         qs = urllib.parse.urlencode({"rule_id": rule_id, "limit": limit})

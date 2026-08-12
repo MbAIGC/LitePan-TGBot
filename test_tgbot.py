@@ -23,6 +23,7 @@ def make_profile():
 
 class StubLite:
     triggers = []
+    runs = []
 
     def __init__(self, profile):
         pass
@@ -33,6 +34,10 @@ class StubLite:
     def trigger(self, event, source, path):
         StubLite.triggers.append((event, source, path))
         return {"matched": 1, "triggered": [{"id": 7, "name": "GY01-剧集"}]}
+
+    def run_rule(self, rule_id):
+        StubLite.runs.append(rule_id)
+        return {"rule_id": rule_id, "submitted": True, "trigger_source": "manual"}
 
     def list_runs(self, rule_id, limit=5):
         return []
@@ -146,24 +151,34 @@ def main():
     text = messages[-1][1]
     assert "（/refresh_am_gy01_juji）" in text and "（/refresh_am_gy01_dianying）" in text, text
     assert "「AM-GY01-剧集」" in text and "「AM-GY01-电影」" in text, text
+    assert "按规则精确执行" in text, text
 
-    # 按规则命令触发
+    # 按规则命令触发：走管理接口按规则 ID 精确执行，不再按事件（避免同名事件全部触发）
     send("/refresh_am_gy01_juji")
-    assert StubLite.triggers[-1] == ("tg_refresh", "telegram", "/"), StubLite.triggers
+    assert StubLite.runs[-1] == 1 and not StubLite.triggers, (StubLite.runs, StubLite.triggers)
+    assert "已提交执行规则：「AM-GY01-剧集」" in messages[-1][1]
     send("/refresh_am_gy01_dianying")
-    assert StubLite.triggers[-1] == ("gy_movie", "telegram", "/"), StubLite.triggers
+    assert StubLite.runs[-1] == 2 and not StubLite.triggers, (StubLite.runs, StubLite.triggers)
+    assert "已提交执行规则：「AM-GY01-电影」" in messages[-1][1]
     send("/refresh_guangyashuaxin")
-    assert StubLite.triggers[-1] == ("gy_refresh", "telegram", "/"), StubLite.triggers
+    assert StubLite.runs[-1] == 3 and not StubLite.triggers
 
-    # 旧账号级 slug 兜底：/refresh_gy01 触发该盘全部单盘规则
+    # 旧账号级 slug 兜底：/refresh_gy01 精确执行该盘全部单盘规则（两条规则 ID）
+    StubLite.runs.clear()
     send("/refresh_gy01")
-    assert StubLite.triggers[-2:] == [("gy_movie", "telegram", "/"), ("tg_refresh", "telegram", "/")]
+    assert StubLite.runs == [1, 2] and not StubLite.triggers, (StubLite.runs, StubLite.triggers)
+    assert "已提交 2 条规则执行" in messages[-1][1]
 
     # 未知 slug
-    before = len(StubLite.triggers)
+    before = len(StubLite.runs)
     send("/refresh_unknown")
     assert "未找到规则命令" in messages[-1][1]
-    assert len(StubLite.triggers) == before
+    assert len(StubLite.runs) == before
+
+    # 默认 /refresh 仍走事件（同名事件规则全部触发 = 全盘语义）
+    StubLite.triggers.clear()
+    send("/refresh")
+    assert StubLite.triggers == [("tg_refresh", "telegram", "/")], StubLite.triggers
 
     # 定时刷新：到期才刷，刷新后重置计时
     bot._last_menu_refresh = time.time() - 301
