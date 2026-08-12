@@ -92,7 +92,7 @@ def make_cfg(profile):
         poll_timeout = 30
         state_file = "/tmp/lpbot-state.json"
         allowed_ids = {123456789}
-        menu_refresh_minutes = 5
+        menu_refresh_minutes = 30
         profiles = {123456789: profile}
         fallback = None
 
@@ -135,23 +135,41 @@ def main():
     assert d.rule_by_slug["am_gy01_dianying"]["name"] == "AM-GY01-电影"
     assert d.rule_by_slug["guangyashuaxin"]["name"] == "光鸭刷新"
 
-    # 菜单映射：按规则名生成命令，描述显示后台规则名
+    # 菜单映射：静态命令 + 按规则名生成命令，描述显示后台规则名；/run 在最后
     bot.refresh_menu(profile)
     cmds = menu_calls[-1]["commands"]
     names = [c["command"] for c in cmds]
     desc = {c["command"]: c["description"] for c in cmds}
-    assert "refresh" in names and "list" in names and "start" in names
+    assert "refresh" in names and "info" in names and "menu" in names and "start" in names
+    assert names[-1] == "run", names
+    assert desc["refresh"] == "触发所有规则"
     assert "refresh_am_gy01_juji" in names and "refresh_am_gy01_dianying" in names
     assert "refresh_guangyashuaxin" in names
     assert desc["refresh_am_gy01_juji"] == "AM-GY01-剧集"
     assert desc["refresh_am_gy01_dianying"] == "AM-GY01-电影"
 
-    # /list 显示快捷命令
+    # 菜单变更检测：内容未变时不再调用 setMyCommands
+    bot.refresh_menu(profile)
+    assert len(menu_calls) == 1
+    # /menu 强制刷新
+    send("/menu")
+    assert len(menu_calls) == 2
+    assert "命令菜单已更新" in messages[-1][1]
+
+    # /info（含 /list /status /ping 别名）显示连接状态、配置、规则、盘名
     send("/list")
     text = messages[-1][1]
+    assert "✅ LitePan 连接正常" in text and "自动发现: 开启" in text, text
     assert "（/refresh_am_gy01_juji）" in text and "（/refresh_am_gy01_dianying）" in text, text
     assert "「AM-GY01-剧集」" in text and "「AM-GY01-电影」" in text, text
     assert "按规则精确执行" in text, text
+    send("/status")
+    assert messages[-1][1] == text
+    send("/ping")
+    assert messages[-1][1] == text
+    send("/info")
+    assert messages[-1][1] == text
+    assert "手动映射(DRIVES)" not in text  # 未配置 DRIVES 时不显示
 
     # 按规则命令触发：走管理接口按规则 ID 精确执行，不再按事件（避免同名事件全部触发）
     send("/refresh_am_gy01_juji")
@@ -175,17 +193,24 @@ def main():
     assert "未找到规则命令" in messages[-1][1]
     assert len(StubLite.runs) == before
 
-    # 默认 /refresh 仍走事件（同名事件规则全部触发 = 全盘语义）
+    # /refresh 触发所有规则（按规则 ID 精确执行全部规则）
+    StubLite.runs.clear()
     StubLite.triggers.clear()
     send("/refresh")
-    assert StubLite.triggers == [("tg_refresh", "telegram", "/")], StubLite.triggers
+    assert StubLite.runs == [1, 2, 3] and not StubLite.triggers, (StubLite.runs, StubLite.triggers)
+    assert "已提交 3 条规则执行" in messages[-1][1]
+
+    # /refresh /路径 不再支持
+    send("/refresh /Movies")
+    assert "路径参数已不再支持" in messages[-1][1]
+    assert StubLite.runs == [1, 2, 3]
 
     # 定时刷新：到期才刷，刷新后重置计时
-    bot._last_menu_refresh = time.time() - 301
+    bot._last_menu_refresh = time.time() - 1801
     assert bot._menu_due() is True
     menu_calls.clear()
-    bot.refresh_menu(profile)
-    assert len(menu_calls) == 1
+    bot.refresh_menu(profile)  # 内容未变 -> 不调用 API，但更新计时
+    assert len(menu_calls) == 0
     assert bot._menu_due() is False
 
     # 启动时刷新菜单（无参数，遍历配置）
