@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""LitePan-TGBot 离线测试：命令路由、自动发现、菜单映射、隐私开关。"""
+"""LitePan-TGBot 离线测试：命令路由、自动发现、规则菜单映射、定时刷新、隐私开关。"""
 
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tgbot
@@ -40,15 +41,14 @@ class StubLite:
         if path == "/api/admin/accounts":
             return [
                 {"id": 1, "name": "GY01"},
-                {"id": 2, "name": "123-A"},
-                {"id": 3, "name": "光鸭"},
+                {"id": 2, "name": "光鸭"},
             ]
         if path == "/api/admin/automation/options":
             return {
                 "strm_tasks": [
                     {"id": 101, "name": "GY01-剧集", "account_id": 1},
-                    {"id": 102, "name": "123-A-综艺", "account_id": 2},
-                    {"id": 103, "name": "光鸭任务", "account_id": 3},
+                    {"id": 102, "name": "GY01-电影", "account_id": 1},
+                    {"id": 103, "name": "光鸭任务", "account_id": 2},
                 ],
                 "organize_tasks": [],
                 "emby": {},
@@ -57,16 +57,16 @@ class StubLite:
             return [
                 {
                     "id": 1,
-                    "name": "GY01-剧集",
+                    "name": "AM-GY01-剧集",
                     "trigger_type": "webhook",
                     "trigger_config": {"event": "tg_refresh"},
                     "actions": [{"type": "strm", "params": {"task_id": 101}}],
                 },
                 {
                     "id": 2,
-                    "name": "123A刷新",
+                    "name": "AM-GY01-电影",
                     "trigger_type": "webhook",
-                    "trigger_config": {"event": "123A_refresh"},
+                    "trigger_config": {"event": "gy_movie"},
                     "actions": [{"type": "strm", "params": {"task_id": 102}}],
                 },
                 {
@@ -87,6 +87,7 @@ def make_cfg(profile):
         poll_timeout = 30
         state_file = "/tmp/lpbot-state.json"
         allowed_ids = {123456789}
+        menu_refresh_minutes = 5
         profiles = {123456789: profile}
         fallback = None
 
@@ -120,44 +121,73 @@ def main():
 
     # 自动发现：账号、任务、规则、slug
     d = bot._discovery(123456789, profile)
-    assert d.slugs == {"gy01": "GY01", "123_a": "123-A", "pan1": "光鸭"}, d.slugs
-    assert d.account_events("GY01") == ["tg_refresh"]
-    assert d.account_events("123-A") == ["123A_refresh"]
+    assert d.slugs == {"gy01": "GY01", "guangya": "光鸭"}, d.slugs
+    assert d.account_events("GY01") == ["gy_movie", "tg_refresh"]
+    assert d.account_events("光鸭") == ["gy_refresh"]
+    # 规则 slug：中文转拼音（剧集->juji、电影->dianying、光鸭刷新->guangyashuaxin）
+    assert set(d.rule_by_slug) == {"am_gy01_juji", "am_gy01_dianying", "guangyashuaxin"}, d.rule_by_slug
+    assert d.rule_by_slug["am_gy01_juji"]["name"] == "AM-GY01-剧集"
+    assert d.rule_by_slug["am_gy01_dianying"]["name"] == "AM-GY01-电影"
+    assert d.rule_by_slug["guangyashuaxin"]["name"] == "光鸭刷新"
 
-    # 菜单映射
+    # 菜单映射：按规则名生成命令，描述显示后台规则名
     bot.refresh_menu(profile)
     cmds = menu_calls[-1]["commands"]
     names = [c["command"] for c in cmds]
     desc = {c["command"]: c["description"] for c in cmds}
     assert "refresh" in names and "list" in names and "start" in names
-    assert "refresh_gy01" in names and "refresh_123_a" in names and "refresh_pan1" in names
-    assert desc["refresh_gy01"] == "刷新 GY01"
+    assert "refresh_am_gy01_juji" in names and "refresh_am_gy01_dianying" in names
+    assert "refresh_guangyashuaxin" in names
+    assert desc["refresh_am_gy01_juji"] == "AM-GY01-剧集"
+    assert desc["refresh_am_gy01_dianying"] == "AM-GY01-电影"
 
     # /list 显示快捷命令
     send("/list")
     text = messages[-1][1]
-    assert "（/refresh_gy01）" in text and "（/refresh_123_a）" in text and "（/refresh_pan1）" in text, text
+    assert "（/refresh_am_gy01_juji）" in text and "（/refresh_am_gy01_dianying）" in text, text
+    assert "「AM-GY01-剧集」" in text and "「AM-GY01-电影」" in text, text
 
-    # 菜单命令触发
-    send("/refresh_gy01")
+    # 按规则命令触发
+    send("/refresh_am_gy01_juji")
     assert StubLite.triggers[-1] == ("tg_refresh", "telegram", "/"), StubLite.triggers
-    send("/refresh_123_a")
-    assert StubLite.triggers[-1] == ("123A_refresh", "telegram", "/"), StubLite.triggers
-    send("/refresh_pan1")
+    send("/refresh_am_gy01_dianying")
+    assert StubLite.triggers[-1] == ("gy_movie", "telegram", "/"), StubLite.triggers
+    send("/refresh_guangyashuaxin")
     assert StubLite.triggers[-1] == ("gy_refresh", "telegram", "/"), StubLite.triggers
+
+    # 旧账号级 slug 兜底：/refresh_gy01 触发该盘全部单盘规则
+    send("/refresh_gy01")
+    assert StubLite.triggers[-2:] == [("gy_movie", "telegram", "/"), ("tg_refresh", "telegram", "/")]
 
     # 未知 slug
     before = len(StubLite.triggers)
     send("/refresh_unknown")
-    assert "未找到盘名命令" in messages[-1][1]
+    assert "未找到规则命令" in messages[-1][1]
     assert len(StubLite.triggers) == before
+
+    # 定时刷新：到期才刷，刷新后重置计时
+    bot._last_menu_refresh = time.time() - 301
+    assert bot._menu_due() is True
+    menu_calls.clear()
+    bot.refresh_menu(profile)
+    assert len(menu_calls) == 1
+    assert bot._menu_due() is False
 
     # 启动时刷新菜单（无参数，遍历配置）
     menu_calls.clear()
     bot2 = tgbot.TelegramBot(make_cfg(profile))
     bot2.tg_call = fake_tg
     bot2.refresh_menu()
-    assert any(c["command"] == "refresh_gy01" for c in menu_calls[-1]["commands"])
+    assert any(c["command"] == "refresh_am_gy01_juji" for c in menu_calls[-1]["commands"])
+
+    # 无 pypinyin 时退化：只保留 ASCII
+    orig = tgbot._PINYIN_AVAILABLE
+    tgbot._PINYIN_AVAILABLE = False
+    try:
+        assert tgbot._slugify("AM-GY01-剧集") == "am_gy01"
+        assert tgbot._slugify("GY01") == "gy01"
+    finally:
+        tgbot._PINYIN_AVAILABLE = orig
 
     print("MENU_TESTS_PASSED")
 

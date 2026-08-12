@@ -35,6 +35,14 @@ from http.cookiejar import CookieJar
 
 log = logging.getLogger("litepan-tgbot")
 
+try:
+    from pypinyin import lazy_pinyin
+
+    _PINYIN_AVAILABLE = True
+except ImportError:
+    lazy_pinyin = None
+    _PINYIN_AVAILABLE = False
+
 
 class ConfigError(Exception):
     pass
@@ -97,7 +105,13 @@ def _env_drives(name):
 
 
 def _slugify(name):
-    """把账号名转成 Telegram 命令可用的 slug（小写字母/数字/下划线）。"""
+    """把名称转成 Telegram 命令可用的 slug（小写字母/数字/下划线）。
+
+    Telegram 命令名不允许中文，中文部分转拼音（剧集 -> juji）；
+    未安装 pypinyin 时退化为仅保留 ASCII 部分。
+    """
+    if _PINYIN_AVAILABLE:
+        name = "".join(lazy_pinyin(name))
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
 
@@ -274,6 +288,7 @@ class Config:
         self._allowed_ids_env = {int(x) for x in allowed.split(",") if x.strip()} if allowed else set()
         self.state_file = _env("TG_STATE_FILE", "tgbot-state.json")
         self.users_file = _env("USERS_FILE", "users.json")
+        self.menu_refresh_minutes = _env_int("TG_MENU_REFRESH_MINUTES", 5)
 
         self.profiles = {}
         self.fallback = None
@@ -286,6 +301,8 @@ class Config:
             )
         if not 1 <= self.poll_timeout <= 300:
             raise ConfigError("TG_POLL_TIMEOUT 需在 1~300 之间")
+        if not 1 <= self.menu_refresh_minutes <= 1440:
+            raise ConfigError("TG_MENU_REFRESH_MINUTES 需在 1~1440 之间")
 
     def _load_profiles(self):
         if os.path.isfile(self.users_file):
@@ -348,6 +365,7 @@ class Discovery:
         self.by_account = {}     # account_id -> set(event)（仅单账号规则）
         self.slugs = {}          # slug（如 gy01） -> 账号名（如 GY01）
         self.account_slug = {}   # 账号名 -> slug
+        self.rule_by_slug = {}   # slug -> 规则 {id, name, event, tasks}
 
     def fetch(self):
         client = LitePanClient(self.profile)
@@ -404,6 +422,7 @@ class Discovery:
             if len(task_accounts) == 1:
                 self.by_account.setdefault(next(iter(task_accounts)), set()).add(ev)
         self._build_slugs()
+        self._build_rule_slugs()
 
     def _build_slugs(self):
         used = set()
@@ -421,6 +440,21 @@ class Discovery:
             used.add(slug)
             self.slugs[slug] = name
             self.account_slug[name] = slug
+
+    def _build_rule_slugs(self):
+        """按规则名生成菜单命令 slug，重名自动加 _2/_3 后缀。"""
+        used = set()
+        for r in sorted(self.rules, key=lambda x: x["id"]):
+            slug = _slugify(r["name"])
+            if not slug:
+                slug = "rule_%s" % r["id"]
+            base, i = slug, 1
+            while slug in used:
+                i += 1
+                slug = "%s_%d" % (base, i)
+            used.add(slug)
+            r["slug"] = slug
+            self.rule_by_slug[slug] = r
 
     def _task_label(self, kind, task_id):
         t = (self.strm_tasks if kind == "strm" else self.organize_tasks).get(task_id)
@@ -447,6 +481,7 @@ class TelegramBot:
         self.stop = threading.Event()
         self._discovery_cache = {}
         self._discovery_ttl = 60
+        self._last_menu_refresh = 0.0
 
     def tg_call(self, method, params):
         url = "%s/bot%s/%s" % (self.cfg.api_base, self.cfg.bot_token, method)
@@ -482,8 +517,12 @@ class TelegramBot:
 
     def run(self):
         log.info("Bot 启动：%d 个用户配置", len(self.cfg.profiles) + (1 if self.cfg.fallback else 0))
+        log.info("命令菜单拼音支持：%s", "开启" if _PINYIN_AVAILABLE else "关闭（纯中文规则名用编号兜底）")
         self.refresh_menu()
+        self._last_menu_refresh = time.time()
         while not self.stop.is_set():
+            if self._menu_due():
+                self.refresh_menu()
             try:
                 updates = self.tg_call(
                     "getUpdates",
@@ -528,7 +567,7 @@ class TelegramBot:
                 "LitePan TG Bot 可用命令：",
                 "/refresh          触发默认规则（全盘）：%s" % default_event,
                 "/refresh <盘名>   触发指定盘，如 /refresh 光鸭-A（盘名取自 LitePan 账号）",
-                "/refresh_<盘>     菜单里按账号生成的快捷命令（/list 后自动更新）",
+                "/refresh_<规则>   菜单里按规则名生成的快捷命令（自动更新）",
                 "/refresh /路径    触发默认规则，路径仅作记录",
                 "/list             自动列出本会话 LitePan 的账号、规则与事件",
                 "/run <事件> [路径] 触发任意 Webhook 事件",
@@ -577,12 +616,19 @@ class TelegramBot:
             self.say(chat_id, self.help_text(profile))
 
     def refresh_slug(self, chat_id, profile, slug):
-        """处理菜单生成的 /refresh_<盘> 命令。"""
+        """处理菜单生成的 /refresh_<规则> 命令；找不到时回退按账号名匹配。"""
         d = self._discovery(chat_id, profile)
-        if d is None or slug not in d.slugs:
+        if d is None:
             self.say(chat_id, "未找到盘名命令「/refresh_%s」，可先 /list 查看。" % slug)
             return
-        account = d.slugs[slug]
+        rule = d.rule_by_slug.get(slug)
+        if rule is not None:
+            self.trigger_and_report(chat_id, profile, rule["event"], profile.source, profile.default_path)
+            return
+        account = d.slugs.get(slug)
+        if account is None:
+            self.say(chat_id, "未找到规则命令「/refresh_%s」，可先 /list 查看。" % slug)
+            return
         events = d.account_events(account)
         if not events:
             self.say(chat_id, "账号「%s」没有可触发的单盘规则。" % account)
@@ -682,7 +728,8 @@ class TelegramBot:
             lines.append("规则（事件 → 名称 → 涉及任务）：")
             for r in d.rules:
                 task_part = "任务：" + "、".join(r["tasks"]) if r["tasks"] else "（未挂任务）"
-                lines.append("  %s → 「%s」，%s" % (r["event"], r["name"], task_part))
+                cmd = "（/refresh_%s）" % r.get("slug", "") if r.get("slug") else ""
+                lines.append("  %s → 「%s」%s，%s" % (r["event"], r["name"], cmd, task_part))
         else:
             lines.append("没有发现 Webhook 自动化规则，请先在 LitePan 后台创建。")
         account_ids = sorted(d.by_account, key=lambda aid: d.accounts.get(aid, str(aid)))
@@ -691,9 +738,7 @@ class TelegramBot:
             lines.append("盘名（/refresh 可用）：")
             for aid in account_ids:
                 name = d.accounts.get(aid, aid)
-                slug = d.account_slug.get(name, "")
-                suffix = "（/refresh_%s）" % slug if slug else ""
-                lines.append("  %s%s → %s" % (name, suffix, "、".join(sorted(d.by_account[aid]))))
+                lines.append("  %s → %s" % (name, "、".join(sorted(d.by_account[aid]))))
         if profile.drives:
             lines.append("")
             lines.append("手动覆盖（DRIVES）：%s" % profile.drive_list_text())
@@ -716,7 +761,7 @@ class TelegramBot:
         self.say(chat_id, profile.describe() + "\n自动发现: %s\n%s" % (discovery, status))
 
     def refresh_menu(self, profile=None):
-        """把发现的账号映射成 Telegram 命令菜单（setMyCommands）。"""
+        """把发现的规则映射成 Telegram 命令菜单（setMyCommands）。"""
         commands = [
             {"command": "start", "description": "帮助"},
             {"command": "refresh", "description": "触发默认规则（全盘）"},
@@ -738,13 +783,17 @@ class TelegramBot:
             chat_id = p.chat_ids[0] if p.chat_ids else 0
             d = self._discovery(chat_id, p)
             if d:
-                for slug, name in d.slugs.items():
-                    commands.append({"command": "refresh_%s" % slug, "description": "刷新 %s" % name})
+                for slug, rule in d.rule_by_slug.items():
+                    commands.append({"command": "refresh_%s" % slug, "description": rule["name"]})
         try:
             self.tg_call("setMyCommands", {"commands": commands})
+            self._last_menu_refresh = time.time()
             log.info("菜单已更新：%d 个命令", len(commands))
         except TgError as e:
             log.warning("更新菜单失败: %s", e)
+
+    def _menu_due(self):
+        return time.time() - self._last_menu_refresh >= self.cfg.menu_refresh_minutes * 60
 
     def trigger_and_report(self, chat_id, profile, event, source, path):
         try:

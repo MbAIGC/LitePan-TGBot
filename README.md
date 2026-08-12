@@ -81,7 +81,7 @@ python3 tgbot.py                  # 启动
 | --- | --- |
 | `/refresh` | 触发本会话的默认规则（即“全盘”规则，动作链里挂了几个盘就刷几个） |
 | `/refresh <盘名>` | 触发指定盘对应的规则，如 `/refresh 光鸭-A`（盘名取自 LitePan 账号，无需手工配置） |
-| `/refresh_<盘>` | Telegram 命令菜单里按账号自动生成的快捷命令，如 `/refresh_gy01` |
+| `/refresh_<规则>` | Telegram 命令菜单里按规则名自动生成的快捷命令，如 `/refresh_am_gy01_juji` |
 | `/refresh /路径` | 触发默认规则，路径仅作记录（LitePan 规则匹配不依赖路径） |
 | `/list` | 自动列出 LitePan 里的账号、规则（事件→名称→涉及任务）与盘名 |
 | `/run <事件> [路径]` | 触发任意 Webhook 事件，如 `/run quarkA_refresh` |
@@ -99,13 +99,21 @@ python3 tgbot.py                  # 启动
 
 ### 命令菜单自动映射
 
-Bot 启动和每次 `/list` 时，会自动调用 `setMyCommands` 把发现的账号注册成 Telegram 命令菜单
+Bot 启动、每次 `/list`，以及**每 5 分钟自动刷新**（`TG_MENU_REFRESH_MINUTES` 可调）时，
+会自动调用 `setMyCommands` 把发现的规则注册成 Telegram 命令菜单
 （聊天输入框点 `/` 弹出的列表）：
 
 - 静态命令：`/start` `/refresh` `/list` `/run` `/ping` `/status`；
-- 动态命令：每个有单盘规则的账号生成一个 `/refresh_<盘>`，例如账号 `GY01` → `/refresh_gy01`（描述：刷新 GY01）；
-- 账号名会自动转成 Telegram 允许的命令格式（小写字母/数字/下划线，纯中文名按 `pan1`、`pan2` 顺序命名），`/list` 里会显示对应的快捷命令名；
+- 动态命令：**每条 Webhook 规则**生成一个 `/refresh_<规则>`，命令由规则名转成拼音/英文 slug，
+  描述直接显示后台规则全名。例如后台规则 `AM-GY01-剧集` → 命令 `/refresh_am_gy01_juji`、描述 `AM-GY01-剧集`；
+- 说明：Telegram 命令名只允许小写英文/数字/下划线（不支持中文），所以命令里的中文部分转成拼音
+  （剧集→juji、电影→dianying）；`/list` 与菜单描述中始终显示后台中文规则全名；
+- 规则名 slug 冲突时自动加 `_2`、`_3` 后缀区分；未安装 pypinyin 时退化为仅保留英文/数字部分；
+- 新增规则后最多等一个刷新周期（默认 5 分钟）菜单自动更新，发 `/list` 可立即刷新；
 - 菜单更新后，Telegram 客户端可能需要重新打开输入框或稍等片刻才能看到新命令。
+
+兼容：旧的按账号名生成的 `/refresh_gy01` 仍然可用（触发该账号的全部单盘规则）；
+按盘刷整盘也可用文本命令 `/refresh <盘名>`。
 
 管理员账号本来就是为了“完成回执”而配的，现在一份配置同时解决回执和盘名自动发现，无需再维护 `DRIVES`。`DRIVES` 降级为“手动覆盖”：配了就优先用它，适合不想给 Bot 管理员权限的用户。
 
@@ -211,5 +219,6 @@ Bot 触发后会用该账号登录（沿用现有 `/api/auth/login` 与 `/api/ad
 - 镜像名：`ghcr.io/<你的GitHub用户名>/litepan-tgbot`；
 - 标签规则：`latest`（默认分支）、`v*`（版本标签）、`sha-<commit>`（每次构建）；
 - 推送使用仓库自带的 `GITHUB_TOKEN`，无需额外配置 Secret。
+- 镜像内置 `pypinyin`（用于中文规则名转拼音命令），无其他第三方依赖。
 
 部署时把 `docker-compose.yml` 里的 `build: .` 换成 `image: ghcr.io/<你的GitHub用户名>/litepan-tgbot:latest` 即可直接用镜像。
