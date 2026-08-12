@@ -159,10 +159,10 @@ def main():
     # /info（含 /list /status /ping 别名）显示连接状态、配置、规则、盘名
     send("/list")
     text = messages[-1][1]
-    assert "✅ LitePan 连接正常" in text and "自动发现: 开启" in text, text
-    assert "（/refresh_am_gy01_juji）" in text and "（/refresh_am_gy01_dianying）" in text, text
-    assert "「AM-GY01-剧集」" in text and "「AM-GY01-电影」" in text, text
-    assert "按规则精确执行" in text, text
+    assert "✅ LitePan 连接正常" in text and "自动发现已开启" in text, text
+    assert "命令：/refresh_am_gy01_juji" in text and "命令：/refresh_am_gy01_dianying" in text, text
+    assert "AM-GY01-剧集（事件" in text and "AM-GY01-电影（事件" in text, text
+    assert "精确执行" in text, text
     send("/status")
     assert messages[-1][1] == text
     send("/ping")

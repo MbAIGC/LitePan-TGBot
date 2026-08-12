@@ -742,40 +742,47 @@ class TelegramBot:
         lines = []
         try:
             LitePanClient(profile).health()
-            lines.append("✅ LitePan 连接正常")
+            status = "✅ LitePan 连接正常"
         except LitePanError as e:
-            lines.append("⚠️ %s" % e)
+            status = "⚠️ %s" % e
         d = self._discovery(chat_id, profile)
-        lines.append("自动发现: %s" % ("开启" if d is not None else "关闭（需管理员账号）"))
+        lines.append("%s · %s" % (status, "自动发现已开启" if d is not None else "自动发现未开启（需管理员账号）"))
         lines.append("")
-        lines.append(profile.describe())
-        lines.append("")
+        lines.append("📋 配置")
+        if profile.show_url:
+            lines.append("· LitePan：%s" % profile.lite_url)
+        if not profile.receipt_enabled:
+            lines.append("· 默认事件：%s（/refresh 兜底）" % (profile.default_event or "auto"))
+        lines.append("· 回执模式：%s" % ("开启（管理员轮询）" if profile.receipt_enabled else "关闭"))
+        if profile.drives:
+            lines.append("· 手动映射：%s" % profile.drive_list_text())
         if d is None:
-            if profile.drives:
-                lines.append("手动映射(DRIVES)：%s" % profile.drive_list_text())
             if not profile.receipt_enabled:
-                lines.append("提示：配置管理员账号后，可自动读取 LitePan 的账号与规则；未配置时 /refresh 使用默认事件触发。")
+                lines.append("")
+                lines.append("💡 配置管理员账号后，可自动读取盘名和规则；未配置时 /refresh 使用默认事件触发。")
             return "\n".join(lines)
+        lines.append("")
         if d.rules:
-            lines.append("规则（事件 → 名称 → 菜单命令 → 任务）：")
+            lines.append("📦 规则（%d 条）" % len(d.rules))
             for r in d.rules:
-                task_part = "任务：" + "、".join(r["tasks"]) if r["tasks"] else "（未挂任务）"
-                cmd = "（/refresh_%s）" % r.get("slug", "") if r.get("slug") else ""
-                lines.append("  %s → 「%s」%s，%s" % (r["event"], r["name"], cmd, task_part))
+                task_part = "、".join(r["tasks"]) if r["tasks"] else "无任务"
+                cmd = "/refresh_%s" % r.get("slug", "") if r.get("slug") else "/run %s" % r["event"]
+                lines.append("· %s（事件 %s）" % (r["name"], r["event"]))
+                lines.append("  命令：%s" % cmd)
+                lines.append("  任务：%s" % task_part)
         else:
-            lines.append("没有发现 Webhook 自动化规则，请先在 LitePan 后台创建。")
+            lines.append("📦 规则（0 条）")
+            lines.append("· 后台还没有 Webhook 自动化规则，请先在 LitePan「自动联动」里创建。")
         account_ids = sorted(d.by_account, key=lambda aid: d.accounts.get(aid, str(aid)))
         if account_ids:
             lines.append("")
-            lines.append("盘名（/refresh 可用）：")
+            lines.append("💾 盘名")
             for aid in account_ids:
                 name = d.accounts.get(aid, aid)
-                lines.append("  %s → %s" % (name, "、".join(sorted(d.by_account[aid]))))
-        if profile.drives:
-            lines.append("")
-            lines.append("手动映射(DRIVES)：%s" % profile.drive_list_text())
+                lines.append("· %s：%s" % (name, "、".join(sorted(d.by_account[aid]))))
         lines.append("")
-        lines.append("提示：/refresh 触发所有规则；/refresh <盘名>、/refresh_<规则> 按规则精确执行；/run 为高级命令，同名事件会全部触发。")
+        lines.append("💡 提示")
+        lines.append("· /refresh 触发所有规则；/refresh <盘名>、/refresh_<规则> 精确执行；/run 为高级命令，同名事件会全部触发。")
         return "\n".join(lines)
 
     def refresh_menu(self, profile=None, force=False):
