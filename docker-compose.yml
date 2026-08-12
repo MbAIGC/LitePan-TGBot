@@ -1,0 +1,16 @@
+services:
+  litepan-tgbot:
+    build: .
+    container_name: litepan-tgbot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    # 如果 LitePan 也是 Docker 容器且在同一网络，可直接用服务名：
+    #   LITEPAN_URL=http://litepan:5211  （在 .env 中配置）
+    # networks:
+    #   - litepan_net
+
+# networks:
+#   litepan_net:
+#     external: true

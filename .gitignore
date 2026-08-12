@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.env
+users.json
+tgbot-state.json
+data/
+.DS_Store
