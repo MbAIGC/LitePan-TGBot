@@ -9,7 +9,7 @@
 ### P0 安全网：测试与 CI
 
 - [ ] 待优化：新增 `requirements.txt`（固定 `pypinyin==0.54.0`），README 补充本地测试的依赖安装说明；CI 增加 `python3 -m unittest`/pytest 测试步骤。当前 `test_tgbot.py` 在干净环境首个断言即失败（`光鸭` 被转成 `pan1` 而非 `guangya`），且 `.github/workflows/docker-image.yml` 只构建推送不跑测试，坏测试可进入 main。
-- [ ] 待优化：增加真实 HTTP mock 测试，覆盖 401 重登录、409 冲突、超时、运行状态变化和多用户菜单隔离等场景。
+- [ ] 待优化：增加真实 HTTP mock 测试，覆盖 401 重登录、409 冲突、超时、运行状态变化等场景。
 
 ### P1 配置解析健壮性
 
@@ -33,9 +33,9 @@
 
 - [ ] 待优化：当前将所有 `!= "running"` 的状态都视为终态，LitePan 处于 queued/pending/waiting 时会提前发送“完成”回执；应显式定义终态（success/failed/error/cancelled），其余状态继续轮询。
 
-### P3 多用户菜单隔离（复核后排后）
+### P3 多用户菜单隔离（确认不修）
 
-- [ ] 待优化：全局 `setMyCommands` + 仅单 profile 内 slug 去重，多用户时菜单互相覆盖、同名规则产生重复命令被 Telegram 拒绝；建议按 chat_id 的 scope 设置菜单或只注册静态命令。问题真实，但项目定位是每用户私有部署自己的 Bot，实际触发概率低、修复成本高，排后处理。
+- [x] 确认不修：部署模型为一个 LitePan 实例对接一个 LitePan-TGBot，使用人通过 `TG_ALLOWED_IDS` 白名单控制，所有使用人共享同一实例的同一份规则，全局 `setMyCommands` 保持菜单一致是正确行为；多用户菜单隔离不适用，无需按 chat_id 设置 scope。
 
 ### P3 文档与打磨
 
