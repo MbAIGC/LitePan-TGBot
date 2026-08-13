@@ -2,6 +2,48 @@
 
 本项目由 Codex + DeepSeek 创建并持续优化。下面按时间顺序记录主要变化，方便回溯每一版做了什么、为什么这么做。
 
+## v0.13（未发布）：三模型 review 待优化清单（2026-08-13）
+
+> 状态：待优化。以下清单由 GPT-5.6、DeepSeek-V4-Pro、DeepSeek-V4-Flash 三个模型对 `tgbot.py`、`test_tgbot.py`、`Dockerfile`、CI 配置及文档的 review 汇总而成，尚未处理。优先级综合三方意见与项目定位（每用户私有部署为主）后排序。
+
+### P0 安全网：测试与 CI
+
+- [ ] 待优化：新增 `requirements.txt`（固定 `pypinyin==0.54.0`），README 补充本地测试的依赖安装说明；CI 增加 `python3 -m unittest`/pytest 测试步骤。当前 `test_tgbot.py` 在干净环境首个断言即失败（`光鸭` 被转成 `pan1` 而非 `guangya`），且 `.github/workflows/docker-image.yml` 只构建推送不跑测试，坏测试可进入 main。
+- [ ] 待优化：增加真实 HTTP mock 测试，覆盖 401 重登录、409 冲突、超时、运行状态变化和多用户菜单隔离等场景。
+
+### P1 配置解析健壮性
+
+- [ ] 待优化：统一封装 `ConfigError`，替换裸 `int()`/`bool()` 解析（`TG_ALLOWED_IDS=abc`、`users.json` 中 `"lite_timeout": "abc"` 目前会直接 traceback 崩溃）。
+- [ ] 待优化：新增 `parse_bool()`，修复 `"show_url": "false"` 被 `bool()` 解析为 `True`、导致 LitePan 地址被意外显示的问题。
+- [ ] 待优化：配置边界校验——`lite_timeout >= 1`、`receipt_poll >= 1`（0 会造成忙轮询，负数让 `sleep()` 抛异常）、`receipt_timeout >= receipt_poll`、`chat_ids` 必须为整数且不可重复（重复目前静默覆盖前一个用户配置）。
+
+### P1 消息处理可靠性（游标 / 幂等 / 回执）
+
+- [ ] 待优化：更新轮询在处理消息前就推进 offset，且异常后仍保存游标，存在“确认但未执行”的消息丢失风险；调用 LitePan 成功后崩溃又可能重复触发。建议明确 at-least-once 投递、为命令增加幂等键，并把处理结果与游标持久化设计清楚。
+- [ ] 待优化：`_save_offset` 非原子写，进程中途被杀可能损坏游标文件，重启后 offset 回退导致 Telegram 重推旧消息；`by_event`、`account_slug` 两个字段只写不读，属死代码。
+- [ ] 待优化：`watch_run` 回执取“比快照更大的最小运行 ID”，同一规则短时间内触发两次时会死等第一个运行结束；若第一个运行卡住，第二个早已完成也收不到回执（建议按规则追踪最新运行 ID）。
+
+### P2 自动发现与 slug 命名
+
+- [ ] 待优化：自动发现字段 `int(... or 0)` 解析脆弱，远端 API 脏字段抛异常且被兜底逻辑吞掉，`/info`、`/refresh` 静默失败；应集中容错、降级为“自动发现失败”并输出可定位日志。
+- [ ] 待优化：账号 slug 与规则 slug 未共用命名空间，规则优先匹配，`/refresh_<slug>` 永远命中规则，账号级“触发该盘全部单盘规则”入口不可达；建议统一维护 used 集合或采用可区分命名。
+- [ ] 待优化：规则归属判定过宽，仅凭一个已知任务属于某账号就把整条规则归入；应记录所有动作的解析结果，只有全部相关任务均成功解析且属于同一账号时才归入单盘规则。
+
+### P2 运行状态判断
+
+- [ ] 待优化：当前将所有 `!= "running"` 的状态都视为终态，LitePan 处于 queued/pending/waiting 时会提前发送“完成”回执；应显式定义终态（success/failed/error/cancelled），其余状态继续轮询。
+
+### P3 多用户菜单隔离（复核后排后）
+
+- [ ] 待优化：全局 `setMyCommands` + 仅单 profile 内 slug 去重，多用户时菜单互相覆盖、同名规则产生重复命令被 Telegram 拒绝；建议按 chat_id 的 scope 设置菜单或只注册静态命令。问题真实，但项目定位是每用户私有部署自己的 Bot，实际触发概率低、修复成本高，排后处理。
+
+### P3 文档与打磨
+
+- [ ] 待优化：`/info` 将自动发现结果为 `None` 一律显示“自动发现未开启（需管理员账号）”，实际可能只是请求失败，需区分文案。
+- [ ] 待优化：`users.json` 存在但为空时不回退 `.env` 单用户模式——复核确认行为合理（文件存在即表示用户选择了 users.json 模式，报错比静默回退更安全），仅优化报错文案，不动逻辑。
+- [ ] 待优化：`TG_ALLOWED_IDS` 与 `users.json` 并存时 env 完全覆盖 users.json——复核确认为白名单安全特性（更严格更安全），不改代码，README 需文档化该行为。
+- [ ] 待优化：Docker 以 root 运行、基础镜像未锁 digest、无健康检查/只读文件系统；CI action 仅锁 tag 未锁 SHA，存在供应链风险。
+
 ## v0.12：全量 review 整改（2026-08-12）
 
 针对整体 review 列出的问题逐项修复：
