@@ -4,7 +4,7 @@
 
 ## v0.13（未发布）：三模型 review 待优化清单（2026-08-13）
 
-> 状态：待优化。以下清单由 GPT-5.6、DeepSeek-V4-Pro、DeepSeek-V4-Flash 三个模型对 `tgbot.py`、`test_tgbot.py`、`Dockerfile`、CI 配置及文档的 review 汇总而成，尚未处理。优先级综合三方意见与项目定位（每用户私有部署为主）后排序。
+> 状态：待优化 → 已于 v0.14 处理（2026-08-13）。以下清单由 GPT-5.6、DeepSeek-V4-Pro、DeepSeek-V4-Flash 三个模型对 `tgbot.py`、`test_tgbot.py`、`Dockerfile`、CI 配置及文档的 review 汇总而成；除「多用户菜单隔离」按部署模型确认不修外，其余条目已在 v0.14 修复。
 
 ### P0 安全网：测试与 CI
 
@@ -43,6 +43,18 @@
 - [ ] 待优化：`users.json` 存在但为空时不回退 `.env` 单用户模式——复核确认行为合理（文件存在即表示用户选择了 users.json 模式，报错比静默回退更安全），仅优化报错文案，不动逻辑。
 - [ ] 待优化：`TG_ALLOWED_IDS` 与 `users.json` 并存时 env 完全覆盖 users.json——复核确认为白名单安全特性（更严格更安全），不改代码，README 需文档化该行为。
 - [ ] 待优化：Docker 以 root 运行、基础镜像未锁 digest、无健康检查/只读文件系统；CI action 仅锁 tag 未锁 SHA，存在供应链风险。
+
+## v0.14：逐项修复三模型 review 问题（2026-08-13）
+
+针对 v0.13 待优化清单逐项修复（多用户菜单隔离按部署模型确认不修）：
+
+- 测试与 CI：新增 `requirements.txt`（固定 `pypinyin==0.54.0`）；CI 增加 test job，安装依赖后运行 `test_tgbot.py` 与 `test_robustness.py`，构建依赖测试通过；仅改 .md 文档（CHANGELOG / 优化记录 / README）时跳过测试与构建；
+- 配置解析：新增 `_parse_bool`/`_parse_int`，users.json 的 show_url / lite_timeout / receipt_poll / receipt_timeout 严格校验（`receipt_poll=0`、`lite_timeout=0`、`receipt_timeout < receipt_poll`、show_url 非法值均报 `ConfigError`）；chat_ids 重复直接报错；`TG_ALLOWED_IDS` 非法值报 `ConfigError` 而不是 traceback；`SHOW_LITEPAN_URL` 同样走严格布尔解析；
+- 消息可靠性：getUpdates 改为“处理成功才推进 offset 并原子落盘”（临时文件 + `os.replace`），单条消息失败重试 5 次后跳过，避免坏消息卡死轮询；`watch_run` 按 `(rule_id, run_id)` 去重回执，同一规则多次触发各自回执，不再死等最早运行；显式终态 `success/failed/error/cancelled`，queued/pending/waiting 继续轮询；
+- 自动发现：字段解析集中容错（`_int_field`/`_str_field`），整体异常降级为“自动发现失败”并记录日志；删除只写不读的 `by_event`、`account_slug`；账号 slug 与规则 slug 共用命名空间（冲突时账号自动加 `_2` 后缀）；规则归属收紧为“所有动作解析成功且全部属于同一账号”，未知任务/其他动作不再误归入单盘；
+- 文案与文档：`/info` 区分“自动发现未开启”与“自动发现失败”；users.json 存在但为空时报明确错误（不静默回退 .env，行为不变）；README 与 .env.example 文档化 `TG_ALLOWED_IDS` 优先覆盖 users.json 的白名单行为；
+- Docker：基础镜像锁 digest，改为非 root 用户 `app` 运行，新增 `--health` 健康检查；docker-compose 增加 `read_only` 与 `tmpfs /tmp`；
+- 新增 `test_robustness.py` 覆盖以上修复（配置校验、游标 at-least-once、回执去重、slug 冲突、规则归属、终态、/info 文案），原有测试全部通过。
 
 ## v0.12：全量 review 整改（2026-08-12）
 

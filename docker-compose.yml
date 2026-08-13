@@ -6,6 +6,11 @@ services:
     env_file: .env
     volumes:
       - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    # 容器以非 root 用户 app（UID 1000）运行，请确保 ./data 可写：
+    #   mkdir -p data && chown 1000:1000 data
     # 如果 LitePan 也是 Docker 容器且在同一网络，可直接用服务名：
     #   LITEPAN_URL=http://litepan:5211  （在 .env 中配置）
     # networks:

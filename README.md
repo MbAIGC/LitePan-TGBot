@@ -114,6 +114,9 @@ docker run -d --name litepan-tgbot \
 - **`/refresh` 触发所有规则，后台需要设置联动吗？**
   需要。`/refresh` 只是把 LitePan 后台已有的 Webhook 自动化规则全部跑一遍。后台一条规则都没建时，它会提示“没有发现规则”；规则建好后无需在 Bot 侧做任何配置，自动发现会直接读到。
 
+- **`TG_ALLOWED_IDS` 和 `users.json` 同时配置了会怎样？**
+  白名单以 `TG_ALLOWED_IDS` 为准（更严格），`users.json` 里的 chat_ids 不会自动加入白名单；只在 users.json 配置过的会话会被拒绝。只配置 `users.json` 时，白名单自动取其中所有 chat_ids。
+
 - **收不到完成回执？**
   确认 `users.json` 里配了管理员账号，任务跑完才会推结果。
 
@@ -138,4 +141,4 @@ docker run -d --name litepan-tgbot \
 
 - 镜像：`ghcr.io/MbAIGC/litepan-tgbot`（CI 自动构建，`latest` / `v*` / `sha-*` 标签）；
 - 变更记录见 [CHANGELOG.md](CHANGELOG.md)；
-- 本地测试：`python3 test_tgbot.py`。
+- 本地测试：先 `pip install -r requirements.txt`，再 `python3 test_tgbot.py` 与 `python3 test_robustness.py`。

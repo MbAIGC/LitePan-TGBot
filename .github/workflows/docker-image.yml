@@ -3,6 +3,8 @@ name: Build Docker Image
 on:
   push:
     branches: ["main"]
+    # 只改文档（CHANGELOG / 优化记录 / README 等 .md）时跳过测试与构建
+    paths-ignore: ["CHANGELOG.md", "优化记录.md", "README.md", "*.md"]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -10,7 +12,27 @@ env:
   IMAGE_NAME: litepan-tgbot
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: |
+          python3 test_tgbot.py
+          python3 test_robustness.py
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

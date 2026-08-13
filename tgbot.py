@@ -70,12 +70,68 @@ def _env(name, default=None, required=False):
     return val.strip()
 
 
-def _env_int(name, default):
+def _env_int(name, default, minimum=None):
     raw = _env(name, str(default))
     try:
-        return int(raw)
+        value = int(raw)
     except ValueError:
         raise ConfigError("环境变量 %s 必须是整数，当前值: %s" % (name, raw))
+    if minimum is not None and value < minimum:
+        raise ConfigError("环境变量 %s 必须 >= %d，当前值: %d" % (name, minimum, value))
+    return value
+
+
+def _parse_int(value, name, minimum=None):
+    """解析配置里的整数；非法值或低于下限时抛 ConfigError。"""
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        raise ConfigError("%s 必须是整数，当前值: %r" % (name, value))
+    if minimum is not None and value < minimum:
+        raise ConfigError("%s 必须 >= %d，当前值: %d" % (name, minimum, value))
+    return value
+
+
+def _raw_value(raw, key, default):
+    """取 JSON 配置字段：缺失或空白字符串视为未设置（保留 0 等合法值）。"""
+    value = raw.get(key)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    return value
+
+
+def _parse_bool(value, name):
+    """严格解析布尔配置：true/false、1/0、yes/no、on/off；非法值抛 ConfigError。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return True
+        if s in ("0", "false", "no", "off"):
+            return False
+    raise ConfigError("%s 必须是 true/false/1/0/yes/no/on/off，当前值: %r" % (name, value))
+
+
+def _int_field(obj, key, default=0):
+    """容错解析接口字段为整数：缺失或类型异常时返回默认值。"""
+    try:
+        return int(obj.get(key) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _str_field(obj, key, default=""):
+    """容错解析接口字段为字符串：缺失或类型异常时返回默认值。"""
+    try:
+        value = obj.get(key)
+        if value is None:
+            return str(default)
+        return str(value).strip() or str(default)
+    except (TypeError, ValueError):
+        return str(default)
 
 
 def _env_drives(name):
@@ -120,6 +176,7 @@ def _slugify(name):
 MAX_SLUG_LEN = 24
 MAX_MENU_COMMANDS = 100
 MAX_MESSAGE_LEN = 4000
+TERMINAL_STATUSES = frozenset({"success", "failed", "error", "cancelled"})
 
 
 def _fit_slug(slug, used, max_len=MAX_SLUG_LEN):
@@ -224,6 +281,10 @@ class UserProfile:
         self.receipt_poll = receipt_poll
         self.receipt_timeout = receipt_timeout
         self.show_url = show_url
+        if receipt_timeout < receipt_poll:
+            raise ConfigError(
+                "receipt_timeout (%d) 必须 >= receipt_poll (%d)" % (receipt_timeout, receipt_poll)
+            )
 
     @property
     def receipt_enabled(self):
@@ -278,6 +339,8 @@ class UserProfile:
                 raise ConfigError("users.json 条目 chat_ids 含非法值: %r" % (c,))
         if not parsed:
             raise ConfigError("users.json 中存在没有 chat_ids 的条目")
+        if len(set(parsed)) != len(parsed):
+            raise ConfigError("users.json 条目 chat_ids 不能重复: %r" % (parsed,))
         chat_ids = parsed
         lite_url = str(raw.get("litepan_url") or "").strip()
         api_key = str(raw.get("api_key") or "").strip()
@@ -294,10 +357,10 @@ class UserProfile:
             drives=raw.get("drives") or {},
             admin_user=str(raw.get("admin_user") or "").strip(),
             admin_password=str(raw.get("admin_password") or "").strip(),
-            lite_timeout=int(raw.get("lite_timeout") or 15),
-            receipt_poll=int(raw.get("receipt_poll") or 5),
-            receipt_timeout=int(raw.get("receipt_timeout") or 1800),
-            show_url=bool(raw.get("show_url", False)),
+            lite_timeout=_parse_int(_raw_value(raw, "lite_timeout", 15), "lite_timeout", minimum=1),
+            receipt_poll=_parse_int(_raw_value(raw, "receipt_poll", 5), "receipt_poll", minimum=1),
+            receipt_timeout=_parse_int(_raw_value(raw, "receipt_timeout", 1800), "receipt_timeout", minimum=1),
+            show_url=_parse_bool(raw.get("show_url", False), "show_url"),
         )
 
     @staticmethod
@@ -315,10 +378,10 @@ class UserProfile:
             drives=_env_drives("DRIVES"),
             admin_user=_env("LITEPAN_ADMIN_USER", ""),
             admin_password=_env("LITEPAN_ADMIN_PASSWORD", ""),
-            lite_timeout=_env_int("LITEPAN_TIMEOUT", 15),
-            receipt_poll=_env_int("TG_RECEIPT_POLL_SECONDS", 5),
-            receipt_timeout=_env_int("TG_RECEIPT_TIMEOUT_SECONDS", 1800),
-            show_url=_env("SHOW_LITEPAN_URL", "0").lower() in ("1", "true", "yes", "on"),
+            lite_timeout=_env_int("LITEPAN_TIMEOUT", 15, minimum=1),
+            receipt_poll=_env_int("TG_RECEIPT_POLL_SECONDS", 5, minimum=1),
+            receipt_timeout=_env_int("TG_RECEIPT_TIMEOUT_SECONDS", 1800, minimum=1),
+            show_url=_parse_bool(_env("SHOW_LITEPAN_URL", "0"), "SHOW_LITEPAN_URL"),
         )
 
 
@@ -336,7 +399,16 @@ class Config:
         self.api_base = _env("TG_API_BASE", "https://api.telegram.org").rstrip("/")
         self.poll_timeout = _env_int("TG_POLL_TIMEOUT", 30)
         allowed = _env("TG_ALLOWED_IDS", "")
-        self._allowed_ids_env = {int(x) for x in allowed.split(",") if x.strip()} if allowed else set()
+        ids = set()
+        for x in allowed.split(","):
+            x = x.strip()
+            if not x:
+                continue
+            try:
+                ids.add(int(x))
+            except ValueError:
+                raise ConfigError("TG_ALLOWED_IDS 含非法值: %r（必须为整数 chat_id）" % x)
+        self._allowed_ids_env = ids
         self.state_file = _env("TG_STATE_FILE", "tgbot-state.json")
         self.users_file = _env("USERS_FILE", "users.json")
         self.menu_refresh_minutes = _env_int("TG_MENU_REFRESH_MINUTES", 30)
@@ -369,6 +441,10 @@ class Config:
             raw_users = data.get("users") if isinstance(data, dict) else data
             if not isinstance(raw_users, list):
                 raise ConfigError("%s 格式错误：应为 {\"users\": [...]}" % self.users_file)
+            if not raw_users:
+                raise ConfigError(
+                    "%s 存在但没有用户条目；若要用 .env 单用户模式，请删除或改名该文件" % self.users_file
+                )
             for raw in raw_users:
                 profile = UserProfile.from_dict(raw)
                 for cid in profile.chat_ids:
@@ -416,39 +492,54 @@ class Discovery:
         self.strm_tasks = {}     # strm task_id -> {name, account_id}
         self.organize_tasks = {} # organize task_id -> {name, account_id}
         self.rules = []          # webhook 规则：{id, name, event, tasks:[], accounts:[]}
-        self.by_event = {}       # event -> [规则]
         self.by_account = {}     # account_id -> set(event)（仅单账号规则）
         self.slugs = {}          # slug（如 gy01） -> 账号名（如 GY01）
-        self.account_slug = {}   # 账号名 -> slug
         self.rule_by_slug = {}   # slug -> 规则 {id, name, event, tasks}
 
     def fetch(self):
+        """从 LitePan 管理接口读取账号、任务、规则；解析异常统一降级为 LitePanError。"""
+        try:
+            self._fetch()
+        except LitePanError:
+            raise
+        except (TypeError, ValueError, AttributeError, KeyError) as e:
+            raise LitePanError("自动发现数据解析失败: %s" % e)
+
+    def _fetch(self):
         client = LitePanClient(self.profile)
         for acc in client.admin_get("/api/admin/accounts"):
-            self.accounts[int(acc.get("id") or 0)] = str(acc.get("name") or "").strip()
+            aid = _int_field(acc, "id")
+            if aid:
+                self.accounts[aid] = _str_field(acc, "name")
         options = {}
         try:
             options = client.admin_get("/api/admin/automation/options") or {}
         except LitePanError:
             options = {}
         for t in options.get("strm_tasks") or []:
-            self.strm_tasks[int(t.get("id") or 0)] = {
-                "name": str(t.get("name") or "").strip(),
-                "account_id": int(t.get("account_id") or 0),
-            }
+            tid = _int_field(t, "id")
+            if tid:
+                self.strm_tasks[tid] = {
+                    "name": _str_field(t, "name"),
+                    "account_id": _int_field(t, "account_id"),
+                }
         for t in options.get("organize_tasks") or []:
-            self.organize_tasks[int(t.get("id") or 0)] = {
-                "name": str(t.get("name") or "").strip(),
-                "account_id": int(t.get("account_id") or 0),
-            }
+            tid = _int_field(t, "id")
+            if tid:
+                self.organize_tasks[tid] = {
+                    "name": _str_field(t, "name"),
+                    "account_id": _int_field(t, "account_id"),
+                }
         for r in client.admin_get("/api/admin/automation/rules"):
             if r.get("trigger_type") != "webhook":
                 continue
-            ev = str((r.get("trigger_config") or {}).get("event") or "").strip()
+            ev = _str_field(r.get("trigger_config") or {}, "event")
             if not ev:
                 continue
+            rid = _int_field(r, "id")
             task_labels = []
             task_accounts = set()
+            parse_ok = True  # 所有动作均成功解析（类型已知且任务存在）
             for a in r.get("actions") or []:
                 atype = a.get("type")
                 kind = None
@@ -456,31 +547,35 @@ class Discovery:
                     kind = "strm"
                 elif atype == "organize":
                     kind = "organize"
-                if kind:
-                    tid = int((a.get("params") or {}).get("task_id") or 0)
-                    if tid:
-                        task_labels.append(self._task_label(kind, tid))
-                        acc_id = (self.strm_tasks if kind == "strm" else self.organize_tasks).get(tid, {}).get("account_id")
-                        if acc_id:
-                            task_accounts.add(acc_id)
+                else:
+                    parse_ok = False
+                    continue
+                tid = _int_field(a.get("params") or {}, "task_id")
+                task = (self.strm_tasks if kind == "strm" else self.organize_tasks).get(tid)
+                if not tid or task is None:
+                    parse_ok = False
+                    continue
+                task_labels.append(task["name"] or "%s任务#%s" % (kind, tid))
+                if task.get("account_id"):
+                    task_accounts.add(task["account_id"])
             info = {
-                "id": int(r.get("id") or 0),
-                "name": str(r.get("name") or "").strip() or ("规则#%s" % r.get("id")),
+                "id": rid,
+                "name": _str_field(r, "name") or ("规则#%s" % rid),
                 "event": ev,
                 "tasks": task_labels,
                 "accounts": sorted(task_accounts),
             }
             self.rules.append(info)
-            self.by_event.setdefault(ev, []).append(info)
-            # 只把“全部任务都属于同一账号”的规则算作该账号的单盘规则，
-            # 避免 /refresh 光鸭-A 误触发挂多账号任务的“全盘”规则。
-            if len(task_accounts) == 1:
+            # 只把“全部动作解析成功、且所有任务都属于同一账号”的规则算作单盘规则，
+            # 避免 /refresh <盘名> 误触发挂未知任务、其他动作或多账号任务的规则。
+            if parse_ok and len(task_accounts) == 1:
                 self.by_account.setdefault(next(iter(task_accounts)), set()).add(ev)
-        self._build_slugs()
         self._build_rule_slugs()
+        self._build_slugs()
 
     def _build_slugs(self):
-        used = set()
+        """账号 slug：与规则 slug 共用命名空间，冲突时自动加 _2/_3 后缀。"""
+        used = set(self.rule_by_slug)
         pan_i = 0
         for aid in sorted(self.by_account, key=lambda a: self.accounts.get(a, "")):
             name = self.accounts.get(aid, "")
@@ -490,7 +585,6 @@ class Discovery:
                 slug = "pan%d" % pan_i
             slug = _fit_slug(slug, used)
             self.slugs[slug] = name
-            self.account_slug[name] = slug
 
     def _build_rule_slugs(self):
         """按规则名生成菜单命令 slug：限长 + 重名自动加 _2/_3 后缀。"""
@@ -502,12 +596,6 @@ class Discovery:
             slug = _fit_slug(slug, used)
             r["slug"] = slug
             self.rule_by_slug[slug] = r
-
-    def _task_label(self, kind, task_id):
-        t = (self.strm_tasks if kind == "strm" else self.organize_tasks).get(task_id)
-        if t and t["name"]:
-            return t["name"]
-        return "%s任务#%s" % (kind, task_id)
 
     def account_rules(self, name):
         """按账号名查该账号的单盘规则：先精确匹配，再唯一子串匹配。"""
@@ -526,6 +614,9 @@ class Discovery:
 
 
 class TelegramBot:
+    MAX_MSG_RETRIES = 5   # 单条消息处理失败的最大重试次数
+    RETRY_SLEEP = 2       # 消息处理失败后的重试间隔（秒）
+
     def __init__(self, cfg):
         self.cfg = cfg
         self.offset = self._load_offset()
@@ -536,6 +627,8 @@ class TelegramBot:
         self._menu_lock = threading.Lock()
         self._last_menu_refresh = 0.0
         self._last_menu_commands = None
+        self._receipted_runs = set()   # 已推送过回执的 (rule_id, run_id)
+        self._receipt_lock = threading.Lock()
 
     def tg_call(self, method, params):
         url = "%s/bot%s/%s" % (self.cfg.api_base, self.cfg.bot_token, method)
@@ -564,9 +657,13 @@ class TelegramBot:
             return 0
 
     def _save_offset(self):
+        """原子写游标：先写临时文件再替换，进程中途被杀不会损坏状态文件。"""
         try:
-            with open(self.cfg.state_file, "w", encoding="utf-8") as f:
+            path = self.cfg.state_file
+            tmp = "%s.tmp" % path
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"offset": self.offset}, f)
+            os.replace(tmp, path)
         except Exception as e:
             log.warning("保存状态文件失败: %s", e)
 
@@ -603,15 +700,39 @@ class TelegramBot:
                     continue
                 if not updates:
                     continue
-                for u in updates:
-                    self.offset = max(self.offset, int(u.get("update_id", 0)) + 1)
-                    if "message" in u:
-                        try:
-                            self.handle_message(u["message"])
-                        except Exception as e:
-                            log.exception("处理消息失败: %s", e)
-                self._save_offset()
+                self._process_updates(updates)
         finally:
+            self._save_offset()
+
+    def _process_updates(self, updates):
+        """逐条处理更新：消息处理成功后才推进 offset 并落盘（at-least-once）。
+
+        单条消息失败会重试，连续失败超过 MAX_MSG_RETRIES 次后跳过并告警，
+        避免某条坏消息永久卡住轮询；重启后 Telegram 重推旧消息时，
+        已落盘的 offset 会直接跳过，避免重复执行。
+        """
+        for u in updates:
+            uid = int(u.get("update_id", 0))
+            if "message" in u:
+                handled = False
+                for attempt in range(1, self.MAX_MSG_RETRIES + 1):
+                    try:
+                        self.handle_message(u["message"])
+                        handled = True
+                        break
+                    except Exception as e:
+                        log.exception(
+                            "处理消息失败 update=%s 第 %d/%d 次: %s",
+                            uid, attempt, self.MAX_MSG_RETRIES, e,
+                        )
+                        if attempt < self.MAX_MSG_RETRIES:
+                            time.sleep(self.RETRY_SLEEP)
+                if not handled:
+                    log.error(
+                        "消息 update=%s 连续 %d 次处理失败，已跳过（避免卡死轮询）",
+                        uid, self.MAX_MSG_RETRIES,
+                    )
+            self.offset = max(self.offset, uid + 1)
             self._save_offset()
 
     @staticmethod
@@ -804,12 +925,17 @@ class TelegramBot:
             d = Discovery(profile)
             try:
                 d.fetch()
-                self._discovery_cache[chat_id] = (time.time(), d)
+                self._discovery_cache[chat_id] = (time.time(), d, False)
                 return d
             except LitePanError as e:
                 log.warning("自动发现失败 chat=%s: %s", chat_id, e)
-                self._discovery_cache[chat_id] = (time.time(), None)
+                self._discovery_cache[chat_id] = (time.time(), None, True)
                 return None
+
+    def _discovery_failed(self, chat_id):
+        """自动发现已尝试但失败（区别于“未开启/无管理员账号”）。"""
+        cached = self._discovery_cache.get(chat_id)
+        return bool(cached and cached[2])
 
     def info_text(self, chat_id, profile):
         """/info：连接状态 + 配置摘要 + 自动发现结果（规则、盘名、菜单命令）。"""
@@ -820,7 +946,15 @@ class TelegramBot:
         except LitePanError as e:
             status = "⚠️ %s" % e
         d = self._discovery(chat_id, profile)
-        lines.append("%s · %s" % (status, "自动发现已开启" if d is not None else "自动发现未开启（需管理员账号）"))
+        if d is not None:
+            status_line = "自动发现已开启"
+        elif not profile.receipt_enabled:
+            status_line = "自动发现未开启（需管理员账号）"
+        elif self._discovery_failed(chat_id):
+            status_line = "自动发现失败（LitePan 接口异常，可稍后重试）"
+        else:
+            status_line = "自动发现未开启"
+        lines.append("%s · %s" % (status, status_line))
         lines.append("")
         lines.append("📋 配置")
         if profile.show_url:
@@ -834,6 +968,9 @@ class TelegramBot:
             if not profile.receipt_enabled:
                 lines.append("")
                 lines.append("💡 配置管理员账号后，可自动读取盘名和规则；未配置时 /refresh 使用默认事件触发。")
+            elif self._discovery_failed(chat_id):
+                lines.append("")
+                lines.append("💡 自动发现失败：LitePan 接口异常或管理员账号不可用，可稍后重试或发送 /menu 触发刷新。")
             return "\n".join(lines)
         lines.append("")
         if d.rules:
@@ -942,14 +1079,15 @@ class TelegramBot:
                 ).start()
 
     def watch_run(self, chat_id, profile, rule_id, rule_name, pre_base=0, client=None):
-        """等待触发后新产生的运行并推送回执。
+        """等待触发后新产生的运行并推送回执（每个运行只回执一次）。
 
         pre_base 是触发前的全局最大运行 ID：触发前先快照，运行创建后其 ID 必然大于
         快照，即使规则秒完成、快照时运行已结束，也能被识别并回执。
+        同一规则短时间内触发多次时，各自的新运行只要进入终态就分别回执，
+        不会死等最早的那个运行（避免第一个卡住时第二个完成却收不到回执）。
         """
         client = client or LitePanClient(profile)
         deadline = time.time() + profile.receipt_timeout
-        target = None
         while time.time() < deadline:
             try:
                 runs = client.list_runs(rule_id, 5)
@@ -961,11 +1099,16 @@ class TelegramBot:
                 rid = int(r.get("id") or 0)
                 if rid <= pre_base:
                     continue
-                if target is None or rid < target:
-                    target = rid
-                if rid == target and r.get("status") != "running":
-                    self.say(chat_id, self.render_result(rule_name, r))
-                    return
+                status = (r.get("status") or "").strip().lower()
+                if status not in TERMINAL_STATUSES:
+                    continue
+                key = (rule_id, rid)
+                with self._receipt_lock:
+                    if key in self._receipted_runs:
+                        continue
+                    self._receipted_runs.add(key)
+                self.say(chat_id, self.render_result(rule_name, r))
+                return
             if self.stop.is_set():
                 return
             time.sleep(profile.receipt_poll)
@@ -1104,6 +1247,18 @@ def main():
         sys.exit(2)
     if "--check" in sys.argv:
         print(cfg.check_summary())
+        return
+    if "--health" in sys.argv:
+        profiles = list(cfg.profiles.values()) + ([cfg.fallback] if cfg.fallback else [])
+        if not profiles:
+            print("health: 无可用 LitePan 配置", file=sys.stderr)
+            sys.exit(1)
+        try:
+            LitePanClient(profiles[0]).health()
+        except LitePanError as e:
+            print("health: %s" % e, file=sys.stderr)
+            sys.exit(1)
+        print("health: ok")
         return
     bot = TelegramBot(cfg)
 
