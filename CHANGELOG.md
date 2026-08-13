@@ -4,7 +4,7 @@
 
 ## v0.13（未发布）：三模型 review 待优化清单（2026-08-13）
 
-> 状态：待优化 → 已于 v0.14 处理（2026-08-13）。以下清单由 GPT-5.6、DeepSeek-V4-Pro、DeepSeek-V4-Flash 三个模型对 `tgbot.py`、`test_tgbot.py`、`Dockerfile`、CI 配置及文档的 review 汇总而成；除「多用户菜单隔离」按部署模型确认不修外，其余条目已在 v0.14 修复。
+> 状态：待优化 → 已于 v0.14 处理（2026-08-13）。以下清单由 GPT-5.6、DeepSeek-V4-Pro、DeepSeek-V4-Flash 三个模型对 `tgbot.py`、`test_tgbot.py`、`Dockerfile`、CI 配置及文档的 review 汇总而成；除「多用户菜单隔离」按部署模型确认不修、HTTP mock 测试（401/409/超时）尚待补外，其余条目已在 v0.14 修复。
 
 ### P0 安全网：测试与 CI
 
