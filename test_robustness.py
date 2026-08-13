@@ -305,6 +305,58 @@ def main():
     finally:
         tgbot.LitePanClient = orig_client
 
+    # ---- 12. 全量规则 all：/refresh 无参数时只触发它，不重复触发其他规则 ----
+    class AllRuleLite:
+        def admin_get(self, path):
+            if path == "/api/admin/accounts":
+                return [{"id": 1, "name": "GY01"}]
+            if path == "/api/admin/automation/options":
+                return {
+                    "strm_tasks": [
+                        {"id": 101, "name": "GY01-剧集", "account_id": 1},
+                        {"id": 102, "name": "GY01-电影", "account_id": 1},
+                    ],
+                    "organize_tasks": [],
+                }
+            if path == "/api/admin/automation/rules":
+                return [
+                    {"id": 1, "name": "all", "trigger_type": "webhook", "trigger_config": {"event": "tg_all"},
+                     "actions": [{"type": "strm", "params": {"task_id": 101}},
+                                 {"type": "strm", "params": {"task_id": 102}}]},
+                    {"id": 2, "name": "剧集刷新", "trigger_type": "webhook", "trigger_config": {"event": "gy_movie"},
+                     "actions": [{"type": "strm", "params": {"task_id": 101}}]},
+                ]
+            raise AssertionError("意外接口: %s" % path)
+
+    class AllLiteClient:
+        runs = []
+
+        def __init__(self, _profile):
+            self.api = AllRuleLite()
+
+        def admin_get(self, path):
+            return self.api.admin_get(path)
+
+        def max_run_id(self):
+            return 0
+
+        def run_rule(self, rule_id):
+            AllLiteClient.runs.append(rule_id)
+            return {"rule_id": rule_id, "submitted": True}
+
+    AllLiteClient.runs = []
+    tgbot.LitePanClient = lambda _profile: AllLiteClient(_profile)
+    try:
+        bot6 = tgbot.TelegramBot(make_cfg(profile))
+        bot6.watch_run = lambda *a, **k: None
+        msgs6 = []
+        bot6.say = lambda _chat, text: msgs6.append(text)
+        bot6.refresh(123456789, profile, "")
+        assert AllLiteClient.runs == [1], AllLiteClient.runs  # 只触发 all 规则（ID=1）
+        assert any("全量规则" in m for m in msgs6), msgs6
+    finally:
+        tgbot.LitePanClient = orig_client
+
     print("ROBUST_TESTS_PASSED")
 
 

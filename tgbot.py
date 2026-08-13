@@ -868,12 +868,24 @@ class TelegramBot:
             self.say(chat_id, "⚠️ 规则「%s」提交失败：%s" % (name, err))
 
     def refresh(self, chat_id, profile, arg):
-        """/refresh 触发所有规则；/refresh <盘名> 精确触发指定盘。"""
+        """/refresh 触发所有规则；存在全量规则 all 时只触发它；/refresh <盘名> 精确触发指定盘。"""
         if not arg:
             d = self._discovery(chat_id, profile)
             if d is not None:
                 if not d.rules:
                     self.say(chat_id, "后台还没有 Webhook 自动化规则，请先在 LitePan「自动联动」里创建。")
+                    return
+                # 全量规则约定：规则名为 all（不区分大小写，slug 为 all）时，
+                # /refresh 无参数只触发它，避免和单盘/单任务规则重复执行；
+                # 未配置全量规则时保持“触发所有规则”的原行为。
+                full = [r for r in d.rules if r.get("slug") == "all" or r["name"].strip().lower() == "all"]
+                if full:
+                    self.say(
+                        chat_id,
+                        "✅ 检测到全量规则「%s」，/refresh 本次只触发它（其他规则请用 /refresh_<规则> 单独触发）。"
+                        % full[0]["name"],
+                    )
+                    self.run_rules_and_report(chat_id, profile, full)
                     return
                 self.run_rules_and_report(chat_id, profile, d.rules)
                 return

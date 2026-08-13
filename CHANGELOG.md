@@ -56,6 +56,14 @@
 - Docker：基础镜像锁 digest，改为非 root 用户 `app` 运行，新增 `--health` 健康检查；docker-compose 增加 `read_only` 与 `tmpfs /tmp`；
 - 新增 `test_robustness.py` 覆盖以上修复（配置校验、游标 at-least-once、回执去重、slug 冲突、规则归属、终态、/info 文案），原有测试全部通过。
 
+## v0.15：/refresh 支持“全量规则 all”约定（2026-08-13）
+
+- 约定：后台存在规则名（不区分大小写）为 `all` 的 Webhook 规则时，它被视为“全量规则”，对应菜单命令 `/refresh_all`；
+- `/refresh`（不带参数）检测到全量规则时只触发它，不再逐个触发其他规则，避免 `all` 与单盘/单任务规则重复执行；没有该规则时保持原行为（触发所有规则）；
+- 其他规则仍可用 `/refresh <盘名>`、`/refresh_<规则>` 精确触发；
+- 适用场景：不是每个 STRM 任务都建了联动规则时，用一条 `all` 规则兜底做全量刷新（刷新目录 + 生成所有 STRM 任务）；
+- README 增加 `> [!WARNING]` 说明该约定，测试补充“全量规则只触发 all”用例。
+
 ## v0.12：全量 review 整改（2026-08-12）
 
 针对整体 review 列出的问题逐项修复：
