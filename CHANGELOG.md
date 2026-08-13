@@ -63,6 +63,7 @@
 - 其他规则仍可用 `/refresh <盘名>`、`/refresh_<规则>` 精确触发；
 - 适用场景：不是每个 STRM 任务都建了联动规则时，用一条 `all` 规则兜底做全量刷新（刷新目录 + 生成所有 STRM 任务）；
 - README 增加 `> [!WARNING]` 说明该约定，测试补充“全量规则只触发 all”用例。
+- Dockerfile 基础镜像取消 digest 锁定，改回 `python:3.12-alpine`（跟随 tag 更新，不再字节级锁定）。
 
 ## v0.12：全量 review 整改（2026-08-12）
 
