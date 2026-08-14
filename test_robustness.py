@@ -205,7 +205,7 @@ def main():
     bot4 = tgbot.TelegramBot(make_cfg(tiny))
     msgs4 = []
     bot4.say = lambda _chat, text: msgs4.append(text)
-    bot4._receipted_runs.add((1, 10))
+    bot4._receipted_runs[("http://A-NAS:5211", 1, 10)] = time.time()
     bot4.watch_run(123456789, tiny, 1, "R1", pre_base=0,
                    client=FakeClient([{"id": 10, "status": "success", "message": "ok", "result": {}}]))
     assert all("执行完成" not in m for m in msgs4), msgs4
@@ -348,12 +348,101 @@ def main():
     tgbot.LitePanClient = lambda _profile: AllLiteClient(_profile)
     try:
         bot6 = tgbot.TelegramBot(make_cfg(profile))
-        bot6.watch_run = lambda *a, **k: None
+        bot6.request_receipt = lambda *a, **k: None
         msgs6 = []
         bot6.say = lambda _chat, text: msgs6.append(text)
         bot6.refresh(123456789, profile, "")
         assert AllLiteClient.runs == [1], AllLiteClient.runs  # 只触发 all 规则（ID=1）
         assert any("全量规则" in m for m in msgs6), msgs6
+    finally:
+        tgbot.LitePanClient = orig_client
+
+    # ---- 13. 回执健壮性：脏字段不杀线程；瞬时多运行全回执；多实例去重；watcher 合并 ----
+    class DirtyClient:
+        def __init__(self, runs):
+            self.runs = runs
+
+        def list_runs(self, rule_id, limit=tgbot.RECEIPT_RUN_WINDOW):
+            return self.runs
+
+    # 非数字 ID 与非 dict result：轮询到超时也不崩溃、不发“完成”回执
+    bot_dirty = tgbot.TelegramBot(make_cfg(tiny))
+    msgs_dirty = []
+    bot_dirty.say = lambda _chat, text: msgs_dirty.append(text)
+    bot_dirty.watch_run(123456789, tiny, 1, "R1", pre_base=0,
+                        client=DirtyClient([{"id": "abc", "status": "success", "result": "oops"}]))
+    assert all("执行完成" not in m for m in msgs_dirty), msgs_dirty
+    assert msgs_dirty and "仍在执行或排队" in msgs_dirty[0], msgs_dirty
+    # render_result 对非 dict result / 非 dict run 直接容错
+    text = tgbot.TelegramBot.render_result("R1", {"id": 1, "status": "success", "result": "oops"})
+    assert "执行完成" in text and "运行ID：1" in text, text
+    text = tgbot.TelegramBot.render_result("R1", "not-a-dict")
+    assert "执行完成" in text, text
+
+    # 同一规则瞬时产生 6 个新运行（id 6..11）：逐轮认领，全部回执
+    runs6 = [{"id": i, "status": "success", "message": "", "result": {}} for i in range(6, 12)]
+    bot6runs = tgbot.TelegramBot(make_cfg(tiny))
+    msgs6r = []
+    bot6runs.say = lambda _chat, text: msgs6r.append(text)
+    bot6runs.watch_run(123456789, tiny, 1, "R1", pre_base=5, client=DirtyClient(runs6))
+    assert len(msgs6r) == 6, msgs6r
+    ids = [m.split("运行ID：")[1].split("\n")[0] for m in msgs6r]
+    assert sorted(int(x) for x in ids) == list(range(6, 12)), ids
+
+    # 不同实例相同 rule/run id：去重 key 带实例，各自回执
+    profB = make_profile(lite_url="http://B-NAS:5211", receipt_poll=0.005, receipt_timeout=0.05)
+    botA = tgbot.TelegramBot(make_cfg(tiny))
+    msgsA = []
+    botA.say = lambda _chat, text: msgsA.append(text)
+    botB = tgbot.TelegramBot(make_cfg(profB))
+    msgsB = []
+    botB.say = lambda _chat, text: msgsB.append(text)
+    botA.watch_run(123456789, tiny, 1, "RA", pre_base=0,
+                   client=DirtyClient([{"id": 10, "status": "success", "message": "", "result": {}}]))
+    botB.watch_run(123456789, profB, 1, "RB", pre_base=0,
+                   client=DirtyClient([{"id": 10, "status": "success", "message": "", "result": {}}]))
+    assert len(msgsA) == 1 and len(msgsB) == 1, (msgsA, msgsB)
+
+    # watcher 合并：同一规则两次提交共用一个轮询线程，各自认领自己的运行
+    class WatcherLite:
+        runs = []
+
+        def __init__(self, _profile):
+            pass
+
+        def list_runs(self, rule_id, limit=tgbot.RECEIPT_RUN_WINDOW):
+            return WatcherLite.runs
+
+    WatcherLite.runs = [
+        {"id": 7, "status": "success", "message": "", "result": {}},
+        {"id": 6, "status": "success", "message": "", "result": {}},
+    ]
+    orig_client = tgbot.LitePanClient
+    tgbot.LitePanClient = lambda _profile: WatcherLite(_profile)
+    try:
+        botw = tgbot.TelegramBot(make_cfg(tiny))
+        msgs_w = []
+        botw.say = lambda _chat, text: msgs_w.append(text)
+        botw.request_receipt(123456789, tiny, 1, "R1", pre_base=5)
+        botw.request_receipt(123456789, tiny, 1, "R1", pre_base=6)
+        deadline = time.time() + 0.3
+        while time.time() < deadline and len([m for m in msgs_w if "执行完成" in m]) < 2:
+            time.sleep(0.005)
+        assert len(botw._watchers) == 1, botw._watchers
+        assert len([m for m in msgs_w if "执行完成" in m]) == 2, msgs_w
+        assert all("仍在执行或排队" not in m for m in msgs_w), msgs_w
+        # 等待项全部结束后线程自动退出并清理注册表
+        deadline = time.time() + 0.5
+        while time.time() < deadline and botw._watchers:
+            time.sleep(0.005)
+        assert not botw._watchers, botw._watchers
+        # 再次提交：重新拉起轮询线程并正常回执
+        WatcherLite.runs = [{"id": 8, "status": "success", "message": "", "result": {}}]
+        botw.request_receipt(123456789, tiny, 1, "R1", pre_base=7)
+        deadline = time.time() + 0.3
+        while time.time() < deadline and len([m for m in msgs_w if "执行完成" in m]) < 3:
+            time.sleep(0.005)
+        assert len([m for m in msgs_w if "执行完成" in m]) == 3, msgs_w
     finally:
         tgbot.LitePanClient = orig_client
 

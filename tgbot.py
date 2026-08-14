@@ -20,6 +20,7 @@ LitePan Telegram Bot —— 独立进程，零改动 LitePan 源码，支持多�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -32,10 +33,16 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from http.cookiejar import CookieJar
+from http.cookiejar import CookieJar, LoadError, MozillaCookieJar
 
 log = logging.getLogger("litepan-tgbot")
-_AUTH_LOCK = threading.Lock()
+
+# 管理员会话基础设施：登录锁与 CookieJar 按 (lite_url, admin_user) 隔离，
+# 避免一个慢/挂死的 LitePan 登录阻塞所有用户；Cookie 尽量落盘复用，减少重复登录。
+_SESSIONS_GUARD = threading.Lock()
+_SESSIONS = {}     # (lite_url, admin_user) -> _ProfileSession
+_AUTH_LOCKS = {}   # (lite_url, admin_user) -> threading.Lock
+_STATE_DIR = None  # Config 初始化时赋值；为 None 时仅做进程内会话复用
 
 try:
     from pypinyin import lazy_pinyin
@@ -116,7 +123,9 @@ def _parse_bool(value, name):
 
 
 def _int_field(obj, key, default=0):
-    """容错解析接口字段为整数：缺失或类型异常时返回默认值。"""
+    """容错解析接口字段为整数：缺失、非 dict 或类型异常时返回默认值。"""
+    if not isinstance(obj, dict):
+        return default
     try:
         return int(obj.get(key) or default)
     except (TypeError, ValueError):
@@ -177,6 +186,10 @@ MAX_SLUG_LEN = 24
 MAX_MENU_COMMANDS = 100
 MAX_MESSAGE_LEN = 4000
 TERMINAL_STATUSES = frozenset({"success", "failed", "error", "cancelled"})
+RECEIPT_RUN_WINDOW = 50   # 单规则轮询窗口：一次拉取的运行数（原为 5，瞬时多运行会漏回执）
+_RECEIPT_DEDUP_MAX = 4096  # 已回执去重表上限，超过后按时间清理
+_RECEIPT_DEDUP_TTL = 7200  # 去重条目保留时长（秒），远大于默认回执超时
+_LOGIN_REMEMBER = "1"      # 管理员登录 remember=1，配合 Cookie 落盘复用会话
 
 
 def _fit_slug(slug, used, max_len=MAX_SLUG_LEN):
@@ -410,6 +423,8 @@ class Config:
                 raise ConfigError("TG_ALLOWED_IDS 含非法值: %r（必须为整数 chat_id）" % x)
         self._allowed_ids_env = ids
         self.state_file = _env("TG_STATE_FILE", "tgbot-state.json")
+        global _STATE_DIR
+        _STATE_DIR = os.path.dirname(os.path.abspath(self.state_file))
         self.users_file = _env("USERS_FILE", "users.json")
         self.menu_refresh_minutes = _env_int("TG_MENU_REFRESH_MINUTES", 30)
 
@@ -627,8 +642,10 @@ class TelegramBot:
         self._menu_lock = threading.Lock()
         self._last_menu_refresh = 0.0
         self._last_menu_commands = None
-        self._receipted_runs = set()   # 已推送过回执的 (rule_id, run_id)
         self._receipt_lock = threading.Lock()
+        self._receipted_runs = {}   # (lite_url, rule_id, run_id) -> 回执时间；按时间清理避免无上限增长
+        self._watchers = {}         # (lite_url, rule_id) -> _RuleWatcher；同一规则只保留一个轮询线程
+        self._watchers_lock = threading.Lock()
 
     def tg_call(self, method, params):
         url = "%s/bot%s/%s" % (self.cfg.api_base, self.cfg.bot_token, method)
@@ -830,11 +847,7 @@ class TelegramBot:
             self.say(chat_id, "⚠️ 规则「%s」提交失败：%s\n可改用 /run %s 触发。" % (rule["name"], e, rule["event"]))
             return
         self.say(chat_id, "✅ 已提交执行规则：「%s」\n任务异步执行中。" % rule["name"])
-        threading.Thread(
-            target=self.watch_run,
-            args=(chat_id, profile, rule["id"], rule["name"], pre_base, client),
-            daemon=True,
-        ).start()
+        self.request_receipt(chat_id, profile, rule["id"], rule["name"], pre_base)
 
     def run_rules_and_report(self, chat_id, profile, rules):
         """精确执行账号下的多条单盘规则；无管理员账号时退回按事件触发。"""
@@ -849,16 +862,12 @@ class TelegramBot:
         except LitePanError as e:
             log.warning("回执快照失败，退化为 0：%s", e)
         ok_names, failed = [], []
+        client = LitePanClient(profile)
         for rule in rules:
             try:
-                client = LitePanClient(profile)
                 client.run_rule(rule["id"])
                 ok_names.append(rule["name"])
-                threading.Thread(
-                    target=self.watch_run,
-                    args=(chat_id, profile, rule["id"], rule["name"], pre_base, client),
-                    daemon=True,
-                ).start()
+                self.request_receipt(chat_id, profile, rule["id"], rule["name"], pre_base)
             except LitePanError as e:
                 failed.append((rule["name"], str(e)))
         if ok_names:
@@ -1071,7 +1080,7 @@ class TelegramBot:
         except LitePanError as e:
             self.say(chat_id, "⚠️ 触发失败：%s" % e)
             return
-        matched = int(data.get("matched") or 0)
+        matched = _int_field(data, "matched")
         triggered = data.get("triggered") or []
         if matched == 0:
             self.say(
@@ -1084,14 +1093,30 @@ class TelegramBot:
         self.say(chat_id, "✅ 已触发 %d 条规则：%s\n任务异步执行中。" % (matched, names))
         if profile.receipt_enabled and triggered:
             for t in triggered:
-                threading.Thread(
-                    target=self.watch_run,
-                    args=(chat_id, profile, t.get("id"), t.get("name") or "", pre_base),
-                    daemon=True,
-                ).start()
+                self.request_receipt(chat_id, profile, t.get("id"), t.get("name") or "", pre_base)
+
+    def request_receipt(self, chat_id, profile, rule_id, rule_name, pre_base=0):
+        """登记一条回执等待：同一 (LitePan 实例, 规则) 复用同一个轮询线程。
+
+        相比每次提交都起一个 watch_run 线程，这里按 (lite_url, rule_id) 合并：
+        反复 /refresh 不会叠加轮询线程，线程空闲后自动退出；轮询复用同一客户端，
+        配合会话 Cookie 复用，避免每次提交都重新登录。
+        """
+        if not profile.receipt_enabled:
+            return
+        key = (profile.lite_url, rule_id)
+        with self._watchers_lock:
+            watcher = self._watchers.get(key)
+            if watcher is None:
+                watcher = _RuleWatcher(self, profile, rule_id)
+                self._watchers[key] = watcher
+            watcher.add(chat_id, rule_name, pre_base)
+            if not watcher.thread.is_alive():
+                watcher.thread = threading.Thread(target=watcher.run, daemon=True)
+                watcher.thread.start()
 
     def watch_run(self, chat_id, profile, rule_id, rule_name, pre_base=0, client=None):
-        """等待触发后新产生的运行并推送回执（每个运行只回执一次）。
+        """同步等待单个规则的新运行并推送回执（测试/兼容入口；生产路径走 request_receipt）。
 
         pre_base 是触发前的全局最大运行 ID：触发前先快照，运行创建后其 ID 必然大于
         快照，即使规则秒完成、快照时运行已结束，也能被识别并回执。
@@ -1099,35 +1124,87 @@ class TelegramBot:
         不会死等最早的那个运行（避免第一个卡住时第二个完成却收不到回执）。
         """
         client = client or LitePanClient(profile)
-        deadline = time.time() + profile.receipt_timeout
-        while time.time() < deadline:
+        entry = _ReceiptEntry(chat_id, rule_name, pre_base, time.time() + profile.receipt_timeout)
+        while time.time() < entry.deadline:
             try:
-                runs = client.list_runs(rule_id, 5)
-            except LitePanError as e:
+                runs = client.list_runs(rule_id, RECEIPT_RUN_WINDOW)
+            except Exception as e:
                 log.warning("轮询任务状态失败 rule=%s: %s", rule_id, e)
                 time.sleep(profile.receipt_poll)
                 continue
-            for r in runs:
-                rid = int(r.get("id") or 0)
-                if rid <= pre_base:
-                    continue
-                status = (r.get("status") or "").strip().lower()
-                if status not in TERMINAL_STATUSES:
-                    continue
-                key = (rule_id, rid)
-                with self._receipt_lock:
-                    if key in self._receipted_runs:
-                        continue
-                    self._receipted_runs.add(key)
-                self.say(chat_id, self.render_result(rule_name, r))
+            if self._claim_receipts(profile, rule_id, runs, [entry]):
                 return
             if self.stop.is_set():
                 return
             time.sleep(profile.receipt_poll)
-        self.say(chat_id, "⏱️ 规则「%s」仍在执行或排队，未在 %d 秒内收到完成回执。" % (rule_name, profile.receipt_timeout))
+        if not entry.claimed and not self.stop.is_set():
+            self.say(chat_id, self._receipt_timeout_text(rule_name, profile))
+
+    @staticmethod
+    def _receipt_timeout_text(rule_name, profile):
+        return "⏱️ 规则「%s」仍在执行或排队，未在 %d 秒内收到完成回执。" % (rule_name, profile.receipt_timeout)
+
+    def _claim_receipts(self, profile, rule_id, runs, entries):
+        """从一次 list_runs 快照中为新运行分配回执，返回本轮已完成的等待项。
+
+        分配规则：每个等待项每轮最多认领一个新终态运行；pre_base 较大的等待项先挑
+        （它的可选项最少），保证同一规则多次触发时各自收到自己的回执；单个提交产生
+        多个新运行（瞬时 5+ 运行）时由同一等待项逐轮认领完，不再丢回执。
+        """
+        pool = []
+        for r in runs:
+            if not isinstance(r, dict):
+                continue
+            rid = _int_field(r, "id")
+            if rid <= 0:
+                continue
+            status = (r.get("status") or "").strip().lower()
+            if status not in TERMINAL_STATUSES:
+                continue
+            key = (profile.lite_url, rule_id, rid)
+            with self._receipt_lock:
+                if key in self._receipted_runs:
+                    continue
+            pool.append((rid, r, key))
+        pool.sort(key=lambda x: x[0], reverse=True)
+        for e in sorted(entries, key=lambda x: x.pre_base, reverse=True):
+            pick = next((i for i, (rid, _, _) in enumerate(pool) if rid > e.pre_base), None)
+            if pick is None:
+                continue
+            rid, r, key = pool.pop(pick)
+            with self._receipt_lock:
+                if key in self._receipted_runs:
+                    continue
+                self._mark_receipted_unlocked(key)
+            e.claimed = True
+            self.say(e.chat_id, self.render_result(e.rule_name, r))
+        done = []
+        for e in entries:
+            if not e.claimed:
+                continue
+            if any(rid > e.pre_base for rid, _, _ in pool):
+                continue
+            done.append(e)
+        return done
+
+    def _mark_receipted_unlocked(self, key):
+        """记录一次回执（调用方需持有 _receipt_lock）；超上限时按时间清理。"""
+        self._receipted_runs[key] = time.time()
+        if len(self._receipted_runs) <= _RECEIPT_DEDUP_MAX:
+            return
+        cutoff = time.time() - _RECEIPT_DEDUP_TTL
+        stale = [k for k, ts in self._receipted_runs.items() if ts < cutoff]
+        for k in stale:
+            del self._receipted_runs[k]
+        if len(self._receipted_runs) > _RECEIPT_DEDUP_MAX:
+            oldest = sorted(self._receipted_runs.items(), key=lambda kv: kv[1])
+            for k, _ in oldest[: len(self._receipted_runs) - _RECEIPT_DEDUP_MAX]:
+                del self._receipted_runs[k]
 
     @staticmethod
     def render_result(rule_name, run):
+        if not isinstance(run, dict):
+            run = {}
         status = run.get("status") or "unknown"
         head = "✅" if status == "success" else "❌"
         lines = [
@@ -1138,10 +1215,13 @@ class TelegramBot:
         msg = (run.get("message") or "").strip()
         if msg:
             lines.append("消息：%s" % msg)
-        steps = (run.get("result") or {}).get("steps") or []
+        result = run.get("result")
+        steps = (result.get("steps") if isinstance(result, dict) else None) or []
         if steps:
             labels = []
             for s in steps:
+                if not isinstance(s, dict):
+                    continue
                 name = s.get("name") or s.get("type") or "?"
                 mark = "✓" if s.get("status") == "success" else "✗"
                 labels.append("%s%s" % (name, mark))
@@ -1149,10 +1229,153 @@ class TelegramBot:
         return "\n".join(lines)
 
 
+class _ReceiptEntry:
+    """一次触发提交对应的回执等待项。"""
+
+    __slots__ = ("chat_id", "rule_name", "pre_base", "deadline", "claimed")
+
+    def __init__(self, chat_id, rule_name, pre_base, deadline):
+        self.chat_id = chat_id
+        self.rule_name = rule_name
+        self.pre_base = pre_base
+        self.deadline = deadline
+        self.claimed = False
+
+
+class _RuleWatcher:
+    """单个 (LitePan 实例, 规则) 的回执轮询线程：多条提交合并到一个线程里顺序处理。
+
+    空闲（没有等待项）一个轮询周期后自动退出；退出瞬间有新提交时自动重启，
+    request_receipt 也会兜底重启死线程，保证等待项不滞留。
+    """
+
+    def __init__(self, bot, profile, rule_id):
+        self.bot = bot
+        self.profile = profile
+        self.rule_id = rule_id
+        self.client = LitePanClient(profile)
+        self.entries = []
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def add(self, chat_id, rule_name, pre_base):
+        with self.lock:
+            self.entries.append(_ReceiptEntry(
+                chat_id, rule_name, pre_base, time.time() + self.profile.receipt_timeout
+            ))
+            self.wake.set()
+
+    def run(self):
+        try:
+            while not self.bot.stop.is_set():
+                with self.lock:
+                    self.wake.clear()
+                    entries = list(self.entries)
+                if not entries:
+                    if self.wake.wait(self.profile.receipt_poll):
+                        continue
+                    with self.lock:
+                        if self.entries:
+                            continue
+                        break
+                self._process(entries)
+                if self.bot.stop.is_set():
+                    return
+                self.wake.wait(self.profile.receipt_poll)
+        finally:
+            key = (self.profile.lite_url, self.rule_id)
+            with self.bot._watchers_lock:
+                with self.lock:
+                    restart = bool(self.entries)
+                if restart:
+                    # 退出瞬间又有新提交：原地重启，避免等待项滞留
+                    self.thread = threading.Thread(target=self.run, daemon=True)
+                    self.thread.start()
+                elif self.bot._watchers.get(key) is self:
+                    del self.bot._watchers[key]
+
+    def _process(self, entries):
+        now = time.time()
+        expired = [e for e in entries if now >= e.deadline]
+        try:
+            runs = self.client.list_runs(self.rule_id, RECEIPT_RUN_WINDOW)
+            done = self.bot._claim_receipts(self.profile, self.rule_id, runs, entries)
+        except Exception as e:
+            log.exception("回执轮询处理失败 rule=%s: %s", self.rule_id, e)
+            done = []
+        for e in entries:
+            if e not in done and e in expired:
+                done.append(e)
+        if not done:
+            return
+        with self.lock:
+            self.entries = [e for e in self.entries if e not in done]
+        for e in done:
+            if not e.claimed and not self.bot.stop.is_set():
+                self.bot.say(e.chat_id, self.bot._receipt_timeout_text(e.rule_name, self.profile))
+
+
+class _ProfileSession:
+    """一个 LitePan 管理员账号的会话：进程内复用 CookieJar，并尽量落盘持久化。"""
+
+    def __init__(self, cookie_file):
+        self.cookie_file = cookie_file
+        self.jar = MozillaCookieJar(cookie_file)
+        if cookie_file and os.path.exists(cookie_file):
+            try:
+                self.jar.load(ignore_discard=True, ignore_expires=True)
+            except (OSError, LoadError) as e:
+                log.warning("读取 LitePan 会话 Cookie 失败：%s", e)
+                self.jar = MozillaCookieJar(cookie_file)
+
+    def save(self):
+        if not self.cookie_file:
+            return
+        try:
+            tmp = "%s.tmp" % self.cookie_file
+            self.jar.save(filename=tmp, ignore_discard=True, ignore_expires=True)
+            os.replace(tmp, self.cookie_file)
+        except (OSError, LoadError) as e:
+            log.warning("保存 LitePan 会话 Cookie 失败：%s", e)
+
+
+def _session_key(cfg):
+    return (cfg.lite_url, cfg.admin_user or "")
+
+
+def _cookie_file(key):
+    if _STATE_DIR is None:
+        return ""
+    digest = hashlib.md5("\x00".join(key).encode("utf-8")).hexdigest()[:12]
+    return os.path.join(_STATE_DIR, "litepan-cookies-%s.txt" % digest)
+
+
+def _profile_session(cfg):
+    key = _session_key(cfg)
+    with _SESSIONS_GUARD:
+        session = _SESSIONS.get(key)
+        if session is None:
+            session = _ProfileSession(_cookie_file(key))
+            _SESSIONS[key] = session
+        return session
+
+
+def _auth_lock_for(cfg):
+    key = _session_key(cfg)
+    with _SESSIONS_GUARD:
+        return _AUTH_LOCKS.setdefault(key, threading.Lock())
+
+
 class LitePanClient:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+        # 同一管理员账号复用同一个 CookieJar（进程内共享 + 尽量落盘），
+        # 避免每次提交/轮询都新建会话、触发 N~2N 次重复登录。
+        session = _profile_session(cfg) if cfg.receipt_enabled else None
+        self._session = session
+        jar = session.jar if session is not None else CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
     def request(self, path, method="GET", data=None, headers=None):
         url = self.cfg.lite_url + path
@@ -1201,16 +1424,18 @@ class LitePanClient:
         return body.get("data") or {}
 
     def login(self):
-        with _AUTH_LOCK:
+        with _auth_lock_for(self.cfg):
             status, body = self.request(
                 "/api/auth/login",
                 method="POST",
-                data={"username": self.cfg.admin_user, "password": self.cfg.admin_password, "remember": "0"},
+                data={"username": self.cfg.admin_user, "password": self.cfg.admin_password, "remember": _LOGIN_REMEMBER},
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
         if status >= 400 or not body.get("success"):
             msg = body.get("message") if isinstance(body, dict) else "HTTP %d" % status
             raise LitePanError("管理员登录失败：%s" % msg)
+        if self._session is not None:
+            self._session.save()
 
     def admin_get(self, path):
         """管理接口 GET，401 时自动重新登录再试一次。"""
@@ -1226,9 +1451,7 @@ class LitePanClient:
     def max_run_id(self):
         """当前全局最大运行 ID（运行列表按 ID 倒序，取第一条即可）。"""
         runs = self.admin_get("/api/admin/automation/runs?limit=1")
-        if runs:
-            return int((runs[0] or {}).get("id") or 0)
-        return 0
+        return _int_field(runs[0], "id") if runs else 0
 
     def run_rule(self, rule_id):
         """按规则 ID 精确执行（管理接口），401 时自动重新登录再试一次。"""
@@ -1242,7 +1465,7 @@ class LitePanClient:
             raise LitePanError(msg)
         return body.get("data") or {}
 
-    def list_runs(self, rule_id, limit=5):
+    def list_runs(self, rule_id, limit=RECEIPT_RUN_WINDOW):
         qs = urllib.parse.urlencode({"rule_id": rule_id, "limit": limit})
         return self.admin_get("/api/admin/automation/runs?%s" % qs)
 

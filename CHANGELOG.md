@@ -2,6 +2,16 @@
 
 本项目由 Codex + DeepSeek 创建并持续优化。下面按时间顺序记录主要变化，方便回溯每一版做了什么、为什么这么做。
 
+## v0.16：回执轮询与管理员会话整改（2026-08-14）
+
+针对四条 review 意见逐项修复：
+
+- 回执解析容错：`watch_run`/`max_run_id` 的裸 `int(r.get("id"))` 改为 `_int_field`，`render_result` 对非 dict run/result/steps 加守卫，脏字段不再让回执线程静默死亡；`trigger_and_report` 的 `matched` 同样容错；
+- 回执轮询合并：生产路径从“每次提交起一个线程”改为 `request_receipt` + `_RuleWatcher`，同一 (LitePan 实例, 规则) 只保留一个轮询线程，反复 `/refresh` 不再叠加线程，线程空闲后自动退出；单规则轮询窗口从 5 提高到 50，每个等待项每轮认领一个新终态运行，同一规则瞬时产生多个新运行也能全部回执；
+- 回执去重：去重 key 由 `(rule_id, run_id)` 扩展为 `(lite_url, rule_id, run_id)`，多实例不再互相吞回执；去重表按时间清理（上限 + 2 小时 TTL），进程内不再无上限增长；
+- 管理员会话：登录锁由全局改为按 (实例, 账号) 隔离，一个慢/挂死的 LitePan 登录不再阻塞所有用户；同一账号的 CookieJar 进程内复用并落盘持久化（与 state 文件同目录），登录请求 `remember=1`，`/refresh` 不再产生 N~2N 次重复登录；
+- 测试：新增脏字段不杀线程、瞬时多运行全回执、多实例去重、watcher 合并/自动退出/重启用例，原有用例全部通过。
+
 ## v0.13（未发布）：三模型 review 待优化清单（2026-08-13）
 
 > 状态：待优化 → 已于 v0.14 处理（2026-08-13）。以下清单由 GPT-5.6、DeepSeek-V4-Pro、DeepSeek-V4-Flash 三个模型对 `tgbot.py`、`test_tgbot.py`、`Dockerfile`、CI 配置及文档的 review 汇总而成；除「多用户菜单隔离」按部署模型确认不修、HTTP mock 测试（401/409/超时）尚待补外，其余条目已在 v0.14 修复。

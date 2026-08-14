@@ -3,5 +3,6 @@ __pycache__/
 .env
 users.json
 tgbot-state.json
+litepan-cookies-*.txt
 data/
 .DS_Store
